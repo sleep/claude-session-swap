@@ -1,5 +1,8 @@
 #!/usr/bin/env node
-// ccswitch — manage multiple Claude Code subscription accounts on macOS.
+// ccswitch — manage multiple Claude Code subscription accounts.
+// Credentials live in the macOS Keychain on darwin and in
+// ~/.claude/.credentials.json everywhere else; both stores hold the same
+// JSON payload, so profiles are interchangeable across platforms.
 // Zero dependencies by design: this tool handles OAuth refresh tokens, so
 // every third-party package would be supply-chain attack surface.
 import { spawnSync } from 'node:child_process';
@@ -14,6 +17,9 @@ export class UsageError extends Error {}
 export function config() {
   return {
     home: process.env.CCSWITCH_HOME || path.join(os.homedir(), '.claude-profiles'),
+    credStore: process.env.CCSWITCH_CRED_STORE || (process.platform === 'darwin' ? 'keychain' : 'file'),
+    credentialsFile:
+      process.env.CCSWITCH_CREDENTIALS_FILE || path.join(os.homedir(), '.claude', '.credentials.json'),
     keychainService: process.env.CCSWITCH_KEYCHAIN_SERVICE || 'Claude Code-credentials',
     claudeJson: process.env.CCSWITCH_CLAUDE_JSON || path.join(os.homedir(), '.claude.json'),
     claudeBin: process.env.CCSWITCH_CLAUDE_BIN || 'claude',
@@ -64,6 +70,46 @@ export function deleteKeychain(cfg = config()) {
   if (r.error) throw r.error;
   if (r.status === 0 || r.status === 44) return; // deleted, or already absent
   throw new Error(`security delete-generic-password failed: ${r.stderr.trim()}`);
+}
+
+// --- File credential store (Linux and everything else) -------------------------
+// Claude Code without a keychain keeps the same payload as a 0600 file at
+// ~/.claude/.credentials.json; these mirror the keychain adapter's contract.
+
+function readCredentialsFile(cfg) {
+  try {
+    return fs.readFileSync(cfg.credentialsFile, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+function writeCredentialsFile(payload, cfg) {
+  fs.mkdirSync(path.dirname(cfg.credentialsFile), { recursive: true, mode: 0o700 });
+  const tmp = `${cfg.credentialsFile}.ccswitch-${process.pid}.tmp`;
+  fs.writeFileSync(tmp, payload, { mode: 0o600 });
+  fs.renameSync(tmp, cfg.credentialsFile);
+}
+
+function deleteCredentialsFile(cfg) {
+  fs.rmSync(cfg.credentialsFile, { force: true });
+}
+
+// --- Store-agnostic credential access -------------------------------------------
+
+export function readCredentials(cfg = config()) {
+  return cfg.credStore === 'keychain' ? readKeychain(cfg) : readCredentialsFile(cfg);
+}
+
+export function writeCredentials(payload, cfg = config()) {
+  if (cfg.credStore === 'keychain') writeKeychain(payload, cfg);
+  else writeCredentialsFile(payload, cfg);
+}
+
+export function deleteCredentials(cfg = config()) {
+  if (cfg.credStore === 'keychain') deleteKeychain(cfg);
+  else deleteCredentialsFile(cfg);
 }
 
 // --- ~/.claude.json surgical updates ------------------------------------------
@@ -176,7 +222,7 @@ export function writeBackup(reason, payload, cfg = config()) {
 
 export function captureLive(cfg = config()) {
   return {
-    credentials: readKeychain(cfg),
+    credentials: readCredentials(cfg),
     oauthAccount: readClaudeJson(cfg).oauthAccount ?? null,
   };
 }
@@ -230,7 +276,7 @@ export function switchTo(name, { dryRun = false } = {}, cfg = config()) {
     );
     return;
   }
-  writeKeychain(profile.credentials, cfg);
+  writeCredentials(profile.credentials, cfg);
   updateOauthAccount(profile.oauthAccount, cfg);
   setActive(name, cfg);
   warnIfClaudeRunning();
@@ -250,7 +296,7 @@ export function tokenExpiry(credentials) {
 
 export function formatList(cfg = config()) {
   const profiles = listProfiles(cfg);
-  if (profiles.length === 0) return 'no profiles yet — add one with "ccswitch login <name>"';
+  if (profiles.length === 0) return 'no profiles yet — save your current login with "ccswitch save <name>"';
   const active = getActive(cfg);
   const header = [' ', 'name', 'email', 'tier', 'token expires', 'saved'];
   const rows = profiles.map((p) => [
@@ -298,6 +344,33 @@ export async function deleteProfileCmd(name, { force = false, dryRun = false } =
   console.log(`deleted "${name}"`);
 }
 
+// --- Save the live login as a profile ----------------------------------------------
+
+export function saveCurrent(name, { force = false, dryRun = false } = {}, cfg = config()) {
+  validateName(name);
+  if (profileExists(name, cfg) && !force) {
+    throw new UsageError(`profile "${name}" already exists; pass --force to overwrite`);
+  }
+  if (dryRun) {
+    console.log(`[dry-run] would save the current login as profile "${name}"`);
+    return;
+  }
+  const live = captureLive(cfg);
+  if (!live.credentials) {
+    throw new UsageError('no live Claude Code login found — use "ccswitch login <name>" instead');
+  }
+  saveProfile(name, live, cfg);
+  const active = getActive(cfg);
+  if (active && active !== name && profileExists(active, cfg) && sameAccount(live.oauthAccount, loadProfile(active, cfg).oauthAccount)) {
+    // The live login already belongs to the active profile; taking over the
+    // active pointer would break token save-back for it on the next switch.
+    console.error(`note: "${active}" stays the active profile; "${name}" holds a copy of the same login`);
+  } else {
+    setActive(name, cfg);
+  }
+  console.log(`saved current login as "${name}" (${live.oauthAccount?.emailAddress ?? 'unknown email'})`);
+}
+
 // --- Guided login -----------------------------------------------------------------
 
 export async function login(name, { dryRun = false } = {}, cfg = config()) {
@@ -337,12 +410,12 @@ export async function login(name, { dryRun = false } = {}, cfg = config()) {
       }
     }
   }
-  deleteKeychain(cfg);
+  deleteCredentials(cfg);
   updateOauthAccount(null, cfg);
   setActive(null, cfg);
   const restore = () => {
     if (live.credentials) {
-      writeKeychain(live.credentials, cfg);
+      writeCredentials(live.credentials, cfg);
       updateOauthAccount(live.oauthAccount, cfg);
       setActive(active, cfg);
     }
@@ -455,6 +528,7 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch <name>               switch to profile <name>
   ccswitch switch <name>        same as above
   ccswitch login <name>         log a new account in and save it as <name>
+  ccswitch save <name>          save the current login as <name> (--force overwrites)
   ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
   ccswitch list                 show saved profiles
   ccswitch delete <name>        delete a profile (--force skips confirmation)
@@ -472,7 +546,7 @@ function requireName(name) {
 async function pickProfile(cfg) {
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
-    throw new UsageError('no profiles yet — add one with "ccswitch login <name>"');
+    throw new UsageError('no profiles yet — save your current login with "ccswitch save <name>"');
   }
   const active = getActive(cfg);
   for (const [i, p] of profiles.entries()) {
@@ -506,6 +580,9 @@ export async function main(argv = process.argv.slice(2)) {
   switch (cmd) {
     case 'login':
       await login(requireName(rest[0]), { dryRun }, cfg);
+      return 0;
+    case 'save':
+      saveCurrent(requireName(rest.find((a) => a !== '--force')), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'switch':
       switchTo(requireName(rest[0]), { dryRun }, cfg);

@@ -5,15 +5,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readKeychain, writeKeychain, deleteKeychain, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, exportProfile, importProfile, materializeRunDir, runProfile, main } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readKeychain, writeKeychain, deleteKeychain, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, main } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
-// and the Keychain service name is unique per test so the real
-// "Claude Code-credentials" entry is never touched.
+// and the credential store is forced to a temp file so the suite runs on any
+// platform and the real login (Keychain or ~/.claude/.credentials.json) is
+// never touched. The macOS Keychain adapter has its own darwin-only test.
 export function sandbox(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-test-'));
   process.env.CCSWITCH_HOME = path.join(home, 'profiles-home');
   process.env.CCSWITCH_CLAUDE_JSON = path.join(home, 'claude.json');
+  process.env.CCSWITCH_CRED_STORE = 'file';
+  process.env.CCSWITCH_CREDENTIALS_FILE = path.join(home, 'credentials.json');
   process.env.CCSWITCH_KEYCHAIN_SERVICE =
     `ccswitch-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -27,6 +30,16 @@ test('config picks up env overrides', (t) => {
   assert.equal(cfg.claudeJson, path.join(home, 'claude.json'));
   assert.match(cfg.keychainService, /^ccswitch-test-/);
   assert.equal(cfg.claudeBin, 'claude');
+  assert.equal(cfg.credStore, 'file');
+  assert.equal(cfg.credentialsFile, path.join(home, 'credentials.json'));
+});
+
+test('config defaults the credential store by platform', (t) => {
+  sandbox(t);
+  delete process.env.CCSWITCH_CRED_STORE;
+  t.after(() => { process.env.CCSWITCH_CRED_STORE = 'file'; });
+  const cfg = config();
+  assert.equal(cfg.credStore, process.platform === 'darwin' ? 'keychain' : 'file');
 });
 
 test('validateName accepts kebab-case, rejects everything else', () => {
@@ -47,7 +60,21 @@ test('ensureHome creates 0700 directories', (t) => {
   }
 });
 
-test('keychain adapter round-trips a payload (macOS)', (t) => {
+test('file credential store round-trips a payload', (t) => {
+  sandbox(t);
+  const cfg = config();
+  assert.equal(readCredentials(cfg), null);
+  writeCredentials('{"claudeAiOauth":{"accessToken":"tok-1"}}', cfg);
+  assert.equal(readCredentials(cfg), '{"claudeAiOauth":{"accessToken":"tok-1"}}');
+  assert.equal(fs.statSync(cfg.credentialsFile).mode & 0o777, 0o600);
+  writeCredentials('{"claudeAiOauth":{"accessToken":"tok-2"}}', cfg); // upsert
+  assert.equal(readCredentials(cfg), '{"claudeAiOauth":{"accessToken":"tok-2"}}');
+  deleteCredentials(cfg);
+  assert.equal(readCredentials(cfg), null);
+  deleteCredentials(cfg); // deleting a missing entry must not throw
+});
+
+test('keychain adapter round-trips a payload', { skip: process.platform !== 'darwin' && 'macOS only' }, (t) => {
   sandbox(t);
   const cfg = config();
   t.after(() => deleteKeychain(cfg));
@@ -128,7 +155,7 @@ function seedTwoProfiles(cfg) {
   saveProfile('alpha', { credentials: '{"tok":"alpha"}', oauthAccount: { emailAddress: 'alpha@x.com' } }, cfg);
   saveProfile('beta', { credentials: '{"tok":"beta"}', oauthAccount: { emailAddress: 'beta@x.com' } }, cfg);
   // Live state = alpha, but with a refreshed token the profile file doesn't have yet.
-  writeKeychain('{"tok":"alpha-refreshed"}', cfg);
+  writeCredentials('{"tok":"alpha-refreshed"}', cfg);
   fs.writeFileSync(
     cfg.claudeJson,
     JSON.stringify({ oauthAccount: { emailAddress: 'alpha@x.com' }, unrelated: [1, 2, 3] }),
@@ -136,15 +163,15 @@ function seedTwoProfiles(cfg) {
   setActive('alpha', cfg);
 }
 
-test('switchTo swaps keychain + oauthAccount, saves back, backs up (macOS)', (t) => {
+test('switchTo swaps keychain + oauthAccount, saves back, backs up', (t) => {
   sandbox(t);
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg);
 
   switchTo('beta', {}, cfg);
 
-  assert.equal(readKeychain(cfg), '{"tok":"beta"}');
+  assert.equal(readCredentials(cfg), '{"tok":"beta"}');
   const cj = JSON.parse(fs.readFileSync(cfg.claudeJson, 'utf8'));
   assert.equal(cj.oauthAccount.emailAddress, 'beta@x.com');
   assert.deepEqual(cj.unrelated, [1, 2, 3]); // untouched
@@ -158,47 +185,47 @@ test('switchTo swaps keychain + oauthAccount, saves back, backs up (macOS)', (t)
   assert.equal(backup.credentials, '{"tok":"alpha-refreshed"}');
 });
 
-test('switchTo --dry-run mutates nothing (macOS)', (t) => {
+test('switchTo --dry-run mutates nothing', (t) => {
   sandbox(t);
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg);
 
   switchTo('beta', { dryRun: true }, cfg);
 
-  assert.equal(readKeychain(cfg), '{"tok":"alpha-refreshed"}');
+  assert.equal(readCredentials(cfg), '{"tok":"alpha-refreshed"}');
   assert.equal(JSON.parse(fs.readFileSync(cfg.claudeJson, 'utf8')).oauthAccount.emailAddress, 'alpha@x.com');
   assert.equal(getActive(cfg), 'alpha');
   assert.ok(!fs.existsSync(path.join(cfg.home, 'backups')) || fs.readdirSync(path.join(cfg.home, 'backups')).length === 0);
 });
 
-test('switchTo to a missing profile fails before touching anything (macOS)', (t) => {
+test('switchTo to a missing profile fails before touching anything', (t) => {
   sandbox(t);
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg);
   assert.throws(() => switchTo('nope', {}, cfg), UsageError);
-  assert.equal(readKeychain(cfg), '{"tok":"alpha-refreshed"}');
+  assert.equal(readCredentials(cfg), '{"tok":"alpha-refreshed"}');
   assert.equal(getActive(cfg), 'alpha');
 });
 
-test('switchTo to the already-active profile keeps the live token (macOS)', (t) => {
+test('switchTo to the already-active profile keeps the live token', (t) => {
   sandbox(t);
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg); // live keychain = {"tok":"alpha-refreshed"}, active = alpha
 
   switchTo('alpha', {}, cfg);
 
-  assert.equal(readKeychain(cfg), '{"tok":"alpha-refreshed"}'); // NOT reverted to {"tok":"alpha"}
+  assert.equal(readCredentials(cfg), '{"tok":"alpha-refreshed"}'); // NOT reverted to {"tok":"alpha"}
   assert.equal(loadProfile('alpha', cfg).credentials, '{"tok":"alpha-refreshed"}'); // save-back still happened
   assert.equal(getActive(cfg), 'alpha');
 });
 
-test('switchTo skips save-back when live identity does not match active profile (macOS)', (t) => {
+test('switchTo skips save-back when live identity does not match active profile', (t) => {
   sandbox(t);
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg); // live keychain = {"tok":"alpha-refreshed"}, active = alpha
   // Live oauthAccount no longer matches the alpha profile, e.g. because the
   // user ran `claude /login` manually outside ccswitch.
@@ -210,22 +237,67 @@ test('switchTo skips save-back when live identity does not match active profile 
   switchTo('beta', {}, cfg);
 
   assert.equal(loadProfile('alpha', cfg).credentials, '{"tok":"alpha"}'); // save-back was skipped
-  assert.equal(readKeychain(cfg), '{"tok":"beta"}'); // the switch itself still completed
+  assert.equal(readCredentials(cfg), '{"tok":"beta"}'); // the switch itself still completed
   assert.equal(getActive(cfg), 'beta');
 });
 
-test('switchTo to self restores a wiped keychain (macOS)', (t) => {
+test('switchTo to self restores a wiped keychain', (t) => {
   sandbox(t);
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg);
   const stored = loadProfile('alpha', cfg).credentials;
-  deleteKeychain(cfg);
+  deleteCredentials(cfg);
 
   switchTo('alpha', {}, cfg);
 
-  assert.equal(readKeychain(cfg), stored);
+  assert.equal(readCredentials(cfg), stored);
   assert.equal(getActive(cfg), 'alpha');
+});
+
+test('saveCurrent snapshots the live login and marks it active', (t) => {
+  sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  writeCredentials('{"tok":"live"}', cfg);
+  fs.writeFileSync(cfg.claudeJson, JSON.stringify({ oauthAccount: { emailAddress: 'me@x.com' } }));
+
+  saveCurrent('personal', {}, cfg);
+
+  assert.equal(loadProfile('personal', cfg).credentials, '{"tok":"live"}');
+  assert.equal(loadProfile('personal', cfg).oauthAccount.emailAddress, 'me@x.com');
+  assert.equal(getActive(cfg), 'personal');
+  // Live state was only read, never written:
+  assert.equal(readCredentials(cfg), '{"tok":"live"}');
+});
+
+test('saveCurrent leaves the active pointer on a matching profile', (t) => {
+  sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  seedTwoProfiles(cfg); // live login = alpha's account, active = alpha
+
+  saveCurrent('alpha-copy', {}, cfg);
+
+  assert.equal(loadProfile('alpha-copy', cfg).credentials, '{"tok":"alpha-refreshed"}');
+  assert.equal(getActive(cfg), 'alpha'); // not stolen by the copy
+});
+
+test('saveCurrent fails without live credentials', (t) => {
+  sandbox(t);
+  const cfg = config();
+  assert.throws(() => saveCurrent('personal', {}, cfg), /no live Claude Code login/);
+  assert.equal(profileExists('personal', cfg), false);
+});
+
+test('saveCurrent refuses to overwrite without --force, --dry-run mutates nothing', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('personal', { credentials: '{"tok":"old"}', oauthAccount: null }, cfg);
+  assert.throws(() => saveCurrent('personal', {}, cfg), /already exists/);
+  saveCurrent('personal', { dryRun: true, force: true }, cfg); // returns before touching the keychain
+  assert.equal(loadProfile('personal', cfg).credentials, '{"tok":"old"}');
+  assert.equal(getActive(cfg), null);
 });
 
 test('tokenExpiry parses expiresAt, tolerates garbage', () => {
@@ -280,16 +352,16 @@ export function fakeClaudeBin(home, script) {
   return bin;
 }
 
-test('login captures a fresh account as a new profile (macOS)', async (t) => {
+test('login captures a fresh account as a new profile', async (t) => {
   const { home } = sandbox(t);
   t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
   fakeClaudeBin(
     home,
-    `security add-generic-password -U -s "$CCSWITCH_KEYCHAIN_SERVICE" -a "$USER" -w '{"tok":"fresh"}'\n` +
+    `printf '%s' '{"tok":"fresh"}' > "$CCSWITCH_CREDENTIALS_FILE"\n` +
       `printf '%s' '{"oauthAccount":{"emailAddress":"second@x.com"}}' > "$CCSWITCH_CLAUDE_JSON"\n`,
   );
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg); // live = alpha (refreshed), active = alpha
 
   await login('second', {}, cfg);
@@ -299,20 +371,20 @@ test('login captures a fresh account as a new profile (macOS)', async (t) => {
   assert.equal(loadProfile('second', cfg).oauthAccount.emailAddress, 'second@x.com');
   // Outgoing live creds were stashed back into the active profile:
   assert.equal(loadProfile('alpha', cfg).credentials, '{"tok":"alpha-refreshed"}');
-  assert.equal(readKeychain(cfg), '{"tok":"fresh"}');
+  assert.equal(readCredentials(cfg), '{"tok":"fresh"}');
 });
 
-test('aborted login restores the previous account (macOS)', async (t) => {
+test('aborted login restores the previous account', async (t) => {
   const { home } = sandbox(t);
   t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
   fakeClaudeBin(home, 'exit 0\n'); // user quit without logging in
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg);
 
   await assert.rejects(() => login('second', {}, cfg), /no new credentials/);
 
-  assert.equal(readKeychain(cfg), '{"tok":"alpha-refreshed"}');
+  assert.equal(readCredentials(cfg), '{"tok":"alpha-refreshed"}');
   assert.equal(JSON.parse(fs.readFileSync(cfg.claudeJson, 'utf8')).oauthAccount.emailAddress, 'alpha@x.com');
   assert.equal(getActive(cfg), 'alpha');
   assert.equal(profileExists('second', cfg), false);
@@ -330,12 +402,12 @@ test('login restores previous state when claudeBin fails to spawn', async (t) =>
   process.env.CCSWITCH_CLAUDE_BIN = path.join(home, 'does-not-exist');
   t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
   const cfg = config();
-  t.after(() => deleteKeychain(cfg));
+  t.after(() => deleteCredentials(cfg));
   seedTwoProfiles(cfg); // live = alpha (refreshed), active = alpha
 
   await assert.rejects(() => login('second', {}, cfg), /could not launch/);
 
-  assert.equal(readKeychain(cfg), '{"tok":"alpha-refreshed"}');
+  assert.equal(readCredentials(cfg), '{"tok":"alpha-refreshed"}');
   assert.equal(getActive(cfg), 'alpha');
   assert.equal(profileExists('second', cfg), false);
 });

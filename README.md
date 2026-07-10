@@ -1,12 +1,12 @@
 # ccswitch
 
-Manage multiple Claude Code subscription accounts on macOS.
+Manage multiple Claude Code subscription accounts on macOS and Linux.
 
-Claude Code stores its login in the macOS Keychain plus an `oauthAccount` entry in `~/.claude.json` — one account at a time. `ccswitch` saves each login as a named profile and swaps them in and out, so you can move between (say) a personal and a work subscription without re-authenticating every time.
+Claude Code stores its login credentials in the macOS Keychain (or, on Linux, in `~/.claude/.credentials.json`) plus an `oauthAccount` entry in `~/.claude.json` — one account at a time. `ccswitch` saves each login as a named profile and swaps them in and out, so you can move between (say) a personal and a work subscription without re-authenticating every time. Both stores hold the same JSON payload, so exported profiles move cleanly between platforms.
 
 ## Install
 
-Requires Node.js ≥ 20 and macOS (the `switch`, `login`, and `delete` commands use the `security` Keychain CLI; `export`/`import` work anywhere).
+Requires Node.js ≥ 20. On macOS credentials are managed through the `security` Keychain CLI; on Linux (and anything else) through the `~/.claude/.credentials.json` file.
 
 ```sh
 git clone <this repo>
@@ -23,6 +23,7 @@ ccswitch                      pick a profile interactively and switch to it
 ccswitch <name>               switch to profile <name>
 ccswitch switch <name>        same as above
 ccswitch login <name>         log a new account in and save it as <name>
+ccswitch save <name>          save the current login as <name> (--force overwrites)
 ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
 ccswitch list                 show saved profiles
 ccswitch delete <name>        delete a profile (--force skips confirmation)
@@ -34,12 +35,12 @@ Every command accepts `--dry-run` to print what it would do without touching any
 
 ### Getting started
 
-Save your current login and add a second account:
+Save your current login, then add a second account:
 
 ```sh
-ccswitch login work
-# ccswitch offers to stash your existing login under a name first,
-# then launches `claude /login` — complete the login and exit (/exit)
+ccswitch save personal # snapshot the login you're already using
+
+ccswitch login work    # launches `claude /login` — complete it and exit (/exit)
 
 ccswitch list
 ccswitch personal      # switch back
@@ -65,10 +66,10 @@ Exported files hold live tokens in plaintext — treat them like passwords.
 
 ## How it works
 
-- **Profiles** live as JSON files in `~/.claude-profiles/profiles/`, holding the Keychain credential payload and the `oauthAccount` identity, with `0600` permissions.
-- **Switching** captures the live credentials, saves them back to the outgoing profile (only if the live identity still matches it), then writes the new profile's credentials to the Keychain and surgically updates the single `oauthAccount` key in `~/.claude.json` via an atomic rename — the other ~95 keys (projects, history, settings) are never touched.
+- **Profiles** live as JSON files in `~/.claude-profiles/profiles/`, holding the credential payload and the `oauthAccount` identity, with `0600` permissions.
+- **Switching** captures the live credentials, saves them back to the outgoing profile (only if the live identity still matches it), then writes the new profile's credentials to the platform store (Keychain on macOS, `~/.claude/.credentials.json` elsewhere) and surgically updates the single `oauthAccount` key in `~/.claude.json` via an atomic rename — the other ~95 keys (projects, history, settings) are never touched.
 - **Backups**: every mutation (switch, login, delete) first writes a timestamped snapshot to `~/.claude-profiles/backups/`, so any state is recoverable.
-- **Safety checks**: a failed or abandoned `login` restores the previous credentials; switching warns if `claude` is currently running (open sessions keep the old account and may rewrite the Keychain on token refresh); the active profile can't be deleted.
+- **Safety checks**: a failed or abandoned `login` restores the previous credentials; switching warns if `claude` is currently running (open sessions keep the old account and may rewrite the stored credentials on token refresh); the active profile can't be deleted.
 
 ### Configuration
 
@@ -77,6 +78,8 @@ Environment variables override the defaults (mainly useful for testing):
 | Variable | Default |
 |---|---|
 | `CCSWITCH_HOME` | `~/.claude-profiles` |
+| `CCSWITCH_CRED_STORE` | `keychain` on macOS, `file` elsewhere |
+| `CCSWITCH_CREDENTIALS_FILE` | `~/.claude/.credentials.json` (file store only) |
 | `CCSWITCH_KEYCHAIN_SERVICE` | `Claude Code-credentials` |
 | `CCSWITCH_CLAUDE_JSON` | `~/.claude.json` |
 | `CCSWITCH_CLAUDE_BIN` | `claude` |

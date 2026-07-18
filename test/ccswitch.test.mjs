@@ -5,17 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readKeychain, writeKeychain, deleteKeychain, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, main } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, saveBackRunDir, main } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
-// and the credential store is forced to a temp file so the suite runs on any
-// platform and the real login (Keychain or ~/.claude/.credentials.json) is
-// never touched. The macOS Keychain adapter has its own darwin-only test.
+// including the credentials file, so the suite runs on any platform and the
+// real login is never touched. The keychain service name is randomized so
+// the darwin migration/eviction path never sees a real entry.
 export function sandbox(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-test-'));
   process.env.CCSWITCH_HOME = path.join(home, 'profiles-home');
   process.env.CCSWITCH_CLAUDE_JSON = path.join(home, 'claude.json');
-  process.env.CCSWITCH_CRED_STORE = 'file';
   process.env.CCSWITCH_CREDENTIALS_FILE = path.join(home, 'credentials.json');
   process.env.CCSWITCH_KEYCHAIN_SERVICE =
     `ccswitch-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -30,16 +29,7 @@ test('config picks up env overrides', (t) => {
   assert.equal(cfg.claudeJson, path.join(home, 'claude.json'));
   assert.match(cfg.keychainService, /^ccswitch-test-/);
   assert.equal(cfg.claudeBin, 'claude');
-  assert.equal(cfg.credStore, 'file');
   assert.equal(cfg.credentialsFile, path.join(home, 'credentials.json'));
-});
-
-test('config defaults the credential store by platform', (t) => {
-  sandbox(t);
-  delete process.env.CCSWITCH_CRED_STORE;
-  t.after(() => { process.env.CCSWITCH_CRED_STORE = 'file'; });
-  const cfg = config();
-  assert.equal(cfg.credStore, process.platform === 'darwin' ? 'keychain' : 'file');
 });
 
 test('validateName accepts kebab-case, rejects everything else', () => {
@@ -72,20 +62,6 @@ test('file credential store round-trips a payload', (t) => {
   deleteCredentials(cfg);
   assert.equal(readCredentials(cfg), null);
   deleteCredentials(cfg); // deleting a missing entry must not throw
-});
-
-test('keychain adapter round-trips a payload', { skip: process.platform !== 'darwin' && 'macOS only' }, (t) => {
-  sandbox(t);
-  const cfg = config();
-  t.after(() => deleteKeychain(cfg));
-  assert.equal(readKeychain(cfg), null);
-  writeKeychain('{"claudeAiOauth":{"accessToken":"tok-1"}}', cfg);
-  assert.equal(readKeychain(cfg), '{"claudeAiOauth":{"accessToken":"tok-1"}}');
-  writeKeychain('{"claudeAiOauth":{"accessToken":"tok-2"}}', cfg); // upsert
-  assert.equal(readKeychain(cfg), '{"claudeAiOauth":{"accessToken":"tok-2"}}');
-  deleteKeychain(cfg);
-  assert.equal(readKeychain(cfg), null);
-  deleteKeychain(cfg); // deleting a missing entry must not throw
 });
 
 test('updateOauthAccount replaces only that key, atomically', (t) => {
@@ -505,8 +481,15 @@ test('cli: export then import round-trips across a fresh store', (t) => {
 test('materializeRunDir writes credentials and identity, preserves extras', (t) => {
   sandbox(t);
   const cfg = config();
+  fs.writeFileSync(cfg.claudeJson, JSON.stringify({ hasCompletedOnboarding: true, theme: 'dark', unrelated: 1 }));
   saveProfile('work', { credentials: '{"tok":"w"}', oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
   const dir = materializeRunDir('work', cfg);
+  // Onboarding flags are seeded from the global config so claude doesn't
+  // replay first-run setup; unrelated global keys are not copied.
+  const seeded = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8'));
+  assert.equal(seeded.hasCompletedOnboarding, true);
+  assert.equal(seeded.theme, 'dark');
+  assert.equal(seeded.unrelated, undefined);
   assert.equal(dir, path.join(cfg.home, 'dirs', 'work'));
   assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
   assert.equal(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8'), '{"tok":"w"}');
@@ -533,6 +516,36 @@ test('runProfile launches claude with CLAUDE_CONFIG_DIR set', (t) => {
   const [dir, argv] = fs.readFileSync(process.env.CCSWITCH_TEST_OUT, 'utf8').split('|');
   assert.equal(dir, path.join(cfg.home, 'dirs', 'work'));
   assert.equal(argv, '--continue');
+});
+
+test('runProfile saves refreshed run-dir credentials back into the profile', (t) => {
+  const { home } = sandbox(t);
+  t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
+  // The fake session refreshes its token, as claude does on expiry.
+  fakeClaudeBin(home, `printf '%s' '{"tok":"w-refreshed"}' > "$CLAUDE_CONFIG_DIR/.credentials.json"\n`);
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"w"}', oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+
+  runProfile('work', [], cfg);
+
+  assert.equal(loadProfile('work', cfg).credentials, '{"tok":"w-refreshed"}');
+});
+
+test('saveBackRunDir skips a mismatched account and an empty run dir', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"w"}', oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const dir = materializeRunDir('work', cfg);
+  // A different account logged in inside the run session:
+  fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'other@x.com' } }));
+  fs.writeFileSync(path.join(dir, '.credentials.json'), '{"tok":"other"}');
+  saveBackRunDir('work', dir, cfg);
+  assert.equal(loadProfile('work', cfg).credentials, '{"tok":"w"}'); // untouched
+
+  // Missing credentials file: no-op.
+  fs.rmSync(path.join(dir, '.credentials.json'));
+  saveBackRunDir('work', dir, cfg);
+  assert.equal(loadProfile('work', cfg).credentials, '{"tok":"w"}');
 });
 
 const CLI = new URL('../ccswitch.mjs', import.meta.url).pathname;

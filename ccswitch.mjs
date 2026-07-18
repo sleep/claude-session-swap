@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // ccswitch — manage multiple Claude Code subscription accounts.
-// Credentials live in the macOS Keychain on darwin and in
-// ~/.claude/.credentials.json everywhere else; both stores hold the same
-// JSON payload, so profiles are interchangeable across platforms.
+// Credentials live in ~/.claude/.credentials.json on every platform. On
+// macOS, Claude Code itself prefers the Keychain, so a lingering Keychain
+// entry is read as the freshest copy and evicted on every write — after
+// which Claude Code falls back to the credentials file.
 // Zero dependencies by design: this tool handles OAuth refresh tokens, so
 // every third-party package would be supply-chain attack surface.
 import { spawnSync } from 'node:child_process';
@@ -17,7 +18,6 @@ export class UsageError extends Error {}
 export function config() {
   return {
     home: process.env.CCSWITCH_HOME || path.join(os.homedir(), '.claude-profiles'),
-    credStore: process.env.CCSWITCH_CRED_STORE || (process.platform === 'darwin' ? 'keychain' : 'file'),
     credentialsFile:
       process.env.CCSWITCH_CREDENTIALS_FILE || path.join(os.homedir(), '.claude', '.credentials.json'),
     keychainService: process.env.CCSWITCH_KEYCHAIN_SERVICE || 'Claude Code-credentials',
@@ -41,40 +41,32 @@ export function ensureHome(cfg = config()) {
   }
 }
 
-// --- Keychain adapter (macOS `security` CLI) ---------------------------------
+// --- Keychain migration & eviction (macOS only) --------------------------------
+// ccswitch no longer stores anything in the Keychain. But Claude Code itself
+// prefers the Keychain on macOS, so: a lingering entry is treated as the
+// freshest copy on read (claude refreshes tokens into it), and every ccswitch
+// write evicts the entry so claude falls back to the credentials file.
 
-export function readKeychain(cfg = config()) {
+export function readKeychainEntry(cfg = config()) {
+  if (process.platform !== 'darwin') return null;
   const r = spawnSync('security', ['find-generic-password', '-s', cfg.keychainService, '-w'], {
     encoding: 'utf8',
   });
-  if (r.error) throw r.error;
+  if (r.error) return null; // `security` unavailable: nothing to migrate
   if (r.status === 0) return r.stdout.replace(/\n$/, '');
-  if (r.status === 44) return null; // errSecItemNotFound: no entry, not a failure
-  throw new Error(`security find-generic-password failed: ${r.stderr.trim()}`);
+  return null; // absent (44) or unreadable: fall back to the file
 }
 
-export function writeKeychain(payload, cfg = config()) {
-  // `security` only accepts the secret via argv (-w); it is briefly visible
-  // in the process list, matching how other keychain CLIs behave locally.
-  const r = spawnSync(
-    'security',
-    ['add-generic-password', '-U', '-s', cfg.keychainService, '-a', os.userInfo().username, '-w', payload],
-    { encoding: 'utf8' },
-  );
-  if (r.error) throw r.error;
-  if (r.status !== 0) throw new Error(`security add-generic-password failed: ${r.stderr.trim()}`);
-}
-
-export function deleteKeychain(cfg = config()) {
+export function evictKeychainEntry(cfg = config()) {
+  if (process.platform !== 'darwin') return;
   const r = spawnSync('security', ['delete-generic-password', '-s', cfg.keychainService], { encoding: 'utf8' });
-  if (r.error) throw r.error;
+  if (r.error) return;
   if (r.status === 0 || r.status === 44) return; // deleted, or already absent
   throw new Error(`security delete-generic-password failed: ${r.stderr.trim()}`);
 }
 
-// --- File credential store (Linux and everything else) -------------------------
-// Claude Code without a keychain keeps the same payload as a 0600 file at
-// ~/.claude/.credentials.json; these mirror the keychain adapter's contract.
+// --- File credential store (all platforms) --------------------------------------
+// Claude Code keeps the same payload as a 0600 file at ~/.claude/.credentials.json.
 
 function readCredentialsFile(cfg) {
   try {
@@ -99,17 +91,17 @@ function deleteCredentialsFile(cfg) {
 // --- Store-agnostic credential access -------------------------------------------
 
 export function readCredentials(cfg = config()) {
-  return cfg.credStore === 'keychain' ? readKeychain(cfg) : readCredentialsFile(cfg);
+  return readKeychainEntry(cfg) ?? readCredentialsFile(cfg);
 }
 
 export function writeCredentials(payload, cfg = config()) {
-  if (cfg.credStore === 'keychain') writeKeychain(payload, cfg);
-  else writeCredentialsFile(payload, cfg);
+  writeCredentialsFile(payload, cfg);
+  evictKeychainEntry(cfg);
 }
 
 export function deleteCredentials(cfg = config()) {
-  if (cfg.credStore === 'keychain') deleteKeychain(cfg);
-  else deleteCredentialsFile(cfg);
+  deleteCredentialsFile(cfg);
+  evictKeychainEntry(cfg);
 }
 
 // --- ~/.claude.json surgical updates ------------------------------------------
@@ -239,7 +231,7 @@ export function warnIfClaudeRunning() {
   const r = spawnSync('pgrep', ['-x', 'claude'], { encoding: 'utf8' });
   if (r.status === 0) {
     console.error(
-      'warning: claude is currently running; open sessions keep the old account and may rewrite the Keychain when their token refreshes',
+      'warning: claude is currently running; open sessions keep the old account and may rewrite the credentials when their token refreshes',
     );
   }
 }
@@ -505,9 +497,41 @@ export function materializeRunDir(name, cfg = config()) {
   const cjPath = path.join(dir, '.claude.json');
   let cj = {};
   if (fs.existsSync(cjPath)) cj = JSON.parse(fs.readFileSync(cjPath, 'utf8'));
+  // A bare .claude.json makes claude replay first-run onboarding (theme
+  // picker etc.); seed those flags from the user's global config once.
+  const global_ = readClaudeJson(cfg);
+  for (const key of ['hasCompletedOnboarding', 'theme']) {
+    if (cj[key] === undefined && global_[key] !== undefined) cj[key] = global_[key];
+  }
+  if (cj.hasCompletedOnboarding === undefined) cj.hasCompletedOnboarding = true;
   cj.oauthAccount = profile.oauthAccount;
   fs.writeFileSync(cjPath, JSON.stringify(cj, null, 2), { mode: 0o600 });
   return dir;
+}
+
+// OAuth refresh tokens are single-use: once the session refreshes, the
+// profile's snapshot is dead. Persist whatever the session left in the run
+// dir back into the profile, or the next run starts from a revoked token.
+export function saveBackRunDir(name, dir, cfg = config()) {
+  let credentials;
+  try {
+    credentials = fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8');
+  } catch {
+    return;
+  }
+  if (!credentials) return;
+  let oauthAccount = null;
+  try {
+    oauthAccount = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')).oauthAccount ?? null;
+  } catch {}
+  const profile = loadProfile(name, cfg);
+  if (!sameAccount(oauthAccount, profile.oauthAccount)) {
+    console.error(
+      `warning: the run session's login doesn't match profile "${name}"; its saved credentials were left untouched`,
+    );
+    return;
+  }
+  saveProfile(name, { credentials, oauthAccount: oauthAccount ?? profile.oauthAccount }, cfg);
 }
 
 export function runProfile(name, claudeArgs, cfg = config()) {
@@ -517,6 +541,7 @@ export function runProfile(name, claudeArgs, cfg = config()) {
     env: { ...process.env, CLAUDE_CONFIG_DIR: dir },
   });
   if (r.error) throw r.error;
+  saveBackRunDir(name, dir, cfg);
   return r.status ?? 1;
 }
 

@@ -775,6 +775,168 @@ export function runProfile(name, claudeArgs, cfg = config()) {
   return r.status ?? 1;
 }
 
+// --- Usage across accounts -------------------------------------------------------
+// First (and only) network code in ccswitch: quota lookups and token refresh
+// against Anthropic's OAuth endpoints, via built-in fetch. fetchImpl is a
+// parameter (like cfg) so tests inject a fake without any mocking library.
+
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'; // Claude Code's public client id
+const TOKEN_URL = 'https://console.anthropic.com/v1/oauth/token';
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
+
+// A dead chain (revoked/rotated-away refresh token) is a user-fixable state,
+// distinct from transient network/server failures.
+export class AuthDeadError extends Error {}
+
+export function tokenExpired(credentials, now = Date.now()) {
+  try {
+    const expiresAt = JSON.parse(credentials)?.claudeAiOauth?.expiresAt;
+    if (!expiresAt) return true;
+    return new Date(expiresAt).getTime() - EXPIRY_MARGIN_MS <= now;
+  } catch {
+    return true;
+  }
+}
+
+export async function refreshCredentials(credentials, fetchImpl = fetch) {
+  const parsed = JSON.parse(credentials);
+  const oauth = parsed?.claudeAiOauth;
+  if (!oauth?.refreshToken) throw new AuthDeadError('no refresh token stored');
+  const res = await fetchImpl(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: OAUTH_CLIENT_ID }),
+  });
+  if (res.status === 400 || res.status === 401 || res.status === 403) {
+    throw new AuthDeadError(`refresh rejected (HTTP ${res.status})`);
+  }
+  if (!res.ok) throw new Error(`token refresh failed (HTTP ${res.status})`);
+  const body = await res.json();
+  parsed.claudeAiOauth = {
+    ...oauth,
+    accessToken: body.access_token,
+    refreshToken: body.refresh_token ?? oauth.refreshToken,
+    expiresAt: Date.now() + (body.expires_in ?? 0) * 1000,
+  };
+  return JSON.stringify(parsed);
+}
+
+export function parseUsage(body) {
+  const win = (o) =>
+    o && typeof o === 'object'
+      ? {
+          utilization: typeof o.utilization === 'number' ? o.utilization : null,
+          resetsAt: typeof o.resets_at === 'string' ? o.resets_at : null,
+        }
+      : null;
+  return { fiveHour: win(body?.five_hour), sevenDay: win(body?.seven_day) };
+}
+
+export async function fetchUsage(credentials, fetchImpl = fetch) {
+  const token = JSON.parse(credentials)?.claudeAiOauth?.accessToken;
+  if (!token) throw new AuthDeadError('no access token stored');
+  const res = await fetchImpl(USAGE_URL, {
+    headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
+  });
+  if (res.status === 401 || res.status === 403) throw new AuthDeadError(`token rejected (HTTP ${res.status})`);
+  if (!res.ok) throw new Error(`usage request failed (HTTP ${res.status})`);
+  return parseUsage(await res.json());
+}
+
+const BAR_WIDTH = 5;
+const EIGHTHS = '▏▎▍▌▋▊▉█';
+
+export function formatBar(utilization, { color = false } = {}) {
+  if (utilization == null) return '-';
+  const pct = Math.max(0, Math.min(100, utilization));
+  const eighths = Math.round((pct / 100) * BAR_WIDTH * 8);
+  const bar = (EIGHTHS[7].repeat(Math.floor(eighths / 8)) + (eighths % 8 ? EIGHTHS[(eighths % 8) - 1] : '')).padEnd(BAR_WIDTH);
+  const label = `${String(Math.round(pct)).padStart(3)}%`;
+  if (!color) return `${bar} ${label}`;
+  const code = pct > 85 ? 31 : pct >= 60 ? 33 : 32;
+  return `\x1b[${code}m${bar}\x1b[0m ${label}`;
+}
+
+export function formatResetIn(resetsAt, now = Date.now()) {
+  if (!resetsAt) return '-';
+  const ms = new Date(resetsAt).getTime() - now;
+  if (!Number.isFinite(ms)) return '-';
+  if (ms <= 0) return 'now';
+  const mins = Math.round(ms / 60000);
+  const d = Math.floor(mins / 1440);
+  const h = Math.floor((mins % 1440) / 60);
+  const m = mins % 60;
+  if (d > 0) return `in ${d}d${String(h).padStart(2, '0')}h`;
+  if (h > 0) return `in ${h}h${String(m).padStart(2, '0')}m`;
+  return `in ${m}m`;
+}
+
+// Colored cells contain ANSI escapes, which occupy string length but no
+// terminal columns — alignment must measure visible width only.
+const visibleWidth = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, '').length;
+
+export function renderTable(header, rows) {
+  const widths = header.map((h, i) => Math.max(visibleWidth(h), ...rows.map((r) => visibleWidth(r[i]))));
+  return [header, ...rows]
+    .map((r) => r.map((c, i) => String(c) + ' '.repeat(widths[i] - visibleWidth(c))).join('  ').trimEnd())
+    .join('\n');
+}
+
+export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
+  const profiles = listProfiles(cfg);
+  if (profiles.length === 0) {
+    console.log('no profiles yet — save your current login with "ccswitch save <name>"');
+    return 0;
+  }
+  const active = getActive(cfg);
+  if (dryRun) {
+    for (const p of profiles) {
+      const credentials = p.name === active ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+      console.log(
+        `[dry-run] would query usage for "${p.name}"${tokenExpired(credentials) ? ' (needs token refresh first)' : ''}`,
+      );
+    }
+    return 0;
+  }
+  const color = process.stdout.isTTY === true;
+  const rows = [];
+  let succeeded = 0;
+  for (const p of profiles) {
+    const isActive = p.name === active;
+    let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+    let status = 'ok';
+    let usage = null;
+    try {
+      if (!credentials) throw new AuthDeadError('no credentials stored');
+      if (tokenExpired(credentials)) {
+        credentials = await refreshCredentials(credentials, fetchImpl);
+        // Persist-before-use: the rotated chain reaches disk before anything
+        // can go wrong with the usage call (or the process).
+        saveProfile(p.name, { credentials, oauthAccount: p.oauthAccount }, cfg);
+        if (isActive) writeCredentials(credentials, cfg);
+        status = 'ok (refreshed)';
+      }
+      usage = await fetchUsage(credentials, fetchImpl);
+      succeeded++;
+    } catch (err) {
+      status = err instanceof AuthDeadError ? `logged out — run "ccswitch login ${p.name}"` : `error: ${err.message}`;
+    }
+    rows.push([
+      isActive ? '*' : ' ',
+      p.name,
+      p.oauthAccount?.emailAddress ?? '-',
+      usage ? formatBar(usage.fiveHour?.utilization ?? null, { color }) : '-',
+      usage ? formatResetIn(usage.fiveHour?.resetsAt ?? null) : '-',
+      usage ? formatBar(usage.sevenDay?.utilization ?? null, { color }) : '-',
+      usage ? formatResetIn(usage.sevenDay?.resetsAt ?? null) : '-',
+      status,
+    ]);
+  }
+  console.log(renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'status'], rows));
+  return succeeded > 0 ? 0 : 1;
+}
+
 // --- CLI --------------------------------------------------------------------------
 
 const HELP = `usage: ccswitch [--dry-run] <command>
@@ -786,6 +948,7 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch save <name>          save the current login as <name> (--force overwrites)
   ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
   ccswitch list                 show saved profiles
+  ccswitch usage                show 5h/7d quota for every profile (refreshes expired tokens)
   ccswitch delete <name>        delete a profile (--force skips confirmation)
   ccswitch export <name> [file] write a profile to a plaintext file (default <name>.ccswitch.json)
   ccswitch import <name> [file] load a profile from such a file (--force overwrites)
@@ -793,6 +956,10 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
   ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
   ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
+
+To use an account on a second machine, run "ccswitch login" there — each
+machine gets its own token chain. Export/import moves a login; two machines
+sharing one exported chain will log each other out on refresh.
 
 State lives in ~/.claude-profiles. Every mutation writes a backup there first.
 Unencrypted stores keep tokens in plaintext; run "ccswitch encrypt" to protect
@@ -867,6 +1034,8 @@ export async function main(argv = process.argv.slice(2)) {
     case 'list':
       console.log(formatList(cfg));
       return 0;
+    case 'usage':
+      return usageCmd({ dryRun }, cfg);
     case 'delete':
       await deleteProfileCmd(requireName(rest[0]), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;

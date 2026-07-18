@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -813,4 +813,197 @@ test('cli: delete --dry-run deletes nothing', (t) => {
   assert.equal(r.status, 0);
   assert.match(r.stdout, /\[dry-run\] would delete profile "old"/);
   assert.equal(profileExists('old', cfg), true);
+});
+
+// --- usage command ---------------------------------------------------------------
+
+const usageCreds = (o) =>
+  JSON.stringify({ claudeAiOauth: { accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: Date.now() + 60 * 60 * 1000, ...o } });
+
+function captureLog(t) {
+  const lines = [];
+  const orig = console.log;
+  console.log = (...a) => lines.push(a.join(' '));
+  t.after(() => { console.log = orig; });
+  return lines;
+}
+
+test('tokenExpired honors the 5-minute margin and fails closed', () => {
+  assert.equal(tokenExpired(usageCreds()), false);
+  assert.equal(tokenExpired(usageCreds({ expiresAt: Date.now() + 2 * 60 * 1000 })), true); // inside margin
+  assert.equal(tokenExpired(usageCreds({ expiresAt: Date.now() - 1000 })), true);
+  assert.equal(tokenExpired(usageCreds({ expiresAt: undefined })), true);
+  assert.equal(tokenExpired('not json'), true);
+  assert.equal(tokenExpired(null), true);
+});
+
+test('refreshCredentials rotates the pair and preserves other fields', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, status: 200, json: async () => ({ access_token: 'at-2', refresh_token: 'rt-2', expires_in: 28800 }) };
+  };
+  const before = JSON.stringify({
+    claudeAiOauth: { accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: 1, scopes: ['user:inference'], subscriptionType: 'max' },
+  });
+  const after = JSON.parse(await refreshCredentials(before, fetchImpl));
+  assert.equal(calls[0].body.grant_type, 'refresh_token');
+  assert.equal(calls[0].body.refresh_token, 'rt-1');
+  assert.equal(after.claudeAiOauth.accessToken, 'at-2');
+  assert.equal(after.claudeAiOauth.refreshToken, 'rt-2');
+  assert.ok(after.claudeAiOauth.expiresAt > Date.now());
+  assert.deepEqual(after.claudeAiOauth.scopes, ['user:inference']);
+  assert.equal(after.claudeAiOauth.subscriptionType, 'max');
+});
+
+test('refreshCredentials maps 400/401 to AuthDeadError, 500 to plain Error', async () => {
+  const respond = (status) => async () => ({ ok: false, status, json: async () => ({}) });
+  await assert.rejects(refreshCredentials(usageCreds(), respond(400)), AuthDeadError);
+  await assert.rejects(refreshCredentials(usageCreds(), respond(401)), AuthDeadError);
+  await assert.rejects(refreshCredentials(usageCreds(), respond(500)), (e) => !(e instanceof AuthDeadError));
+  await assert.rejects(refreshCredentials('{}', async () => {}), AuthDeadError); // no refresh token
+});
+
+test('fetchUsage sends bearer + beta headers and parses windows', async () => {
+  let seen;
+  const fetchImpl = async (url, init) => {
+    seen = { url, headers: init.headers };
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        five_hour: { utilization: 58, resets_at: '2026-07-18T20:00:00Z' },
+        seven_day: { utilization: 84.4, resets_at: '2026-07-24T00:00:00Z' },
+        extra_field: true,
+      }),
+    };
+  };
+  const u = await fetchUsage(usageCreds(), fetchImpl);
+  assert.equal(seen.headers.Authorization, 'Bearer at-1');
+  assert.equal(seen.headers['anthropic-beta'], 'oauth-2025-04-20');
+  assert.equal(u.fiveHour.utilization, 58);
+  assert.equal(u.sevenDay.resetsAt, '2026-07-24T00:00:00Z');
+});
+
+test('fetchUsage maps 401/403 to AuthDeadError; parseUsage tolerates gaps', async () => {
+  await assert.rejects(fetchUsage(usageCreds(), async () => ({ ok: false, status: 401 })), AuthDeadError);
+  await assert.rejects(fetchUsage(usageCreds(), async () => ({ ok: false, status: 500 })), (e) => !(e instanceof AuthDeadError));
+  assert.deepEqual(parseUsage({}), { fiveHour: null, sevenDay: null });
+  assert.deepEqual(parseUsage({ five_hour: { utilization: 'x' } }), {
+    fiveHour: { utilization: null, resetsAt: null },
+    sevenDay: null,
+  });
+});
+
+test('formatBar renders fixed-width bars, clamps, and colors by threshold', () => {
+  assert.equal(formatBar(null), '-');
+  assert.equal(formatBar(0), '        0%');
+  assert.equal(formatBar(58), '██▉    58%');
+  assert.equal(formatBar(100), '█████ 100%');
+  assert.equal(formatBar(250), '█████ 100%'); // clamped
+  assert.match(formatBar(58, { color: true }), /^\x1b\[32m/); // green < 60
+  assert.match(formatBar(70, { color: true }), /^\x1b\[33m/); // yellow 60–85
+  assert.match(formatBar(90, { color: true }), /^\x1b\[31m/); // red > 85
+});
+
+test('formatResetIn picks the right granularity', () => {
+  const now = Date.UTC(2026, 6, 18, 12, 0, 0);
+  const at = (ms) => new Date(now + ms).toISOString();
+  assert.equal(formatResetIn(null), '-');
+  assert.equal(formatResetIn(at(-1000), now), 'now');
+  assert.equal(formatResetIn(at(12 * 60000), now), 'in 12m');
+  assert.equal(formatResetIn(at((3 * 60 + 27) * 60000), now), 'in 3h27m');
+  assert.equal(formatResetIn(at((5 * 24 + 23) * 3600000), now), 'in 5d23h');
+});
+
+test('renderTable aligns columns ignoring ANSI escapes', () => {
+  const out = renderTable(['a', 'b'], [['\x1b[32mxx\x1b[0m', 'y'], ['zzz', 'w']]);
+  // Compare visible positions: escape sequences occupy string indices but no columns.
+  const lines = out.split('\n').map((l) => l.replace(/\x1b\[[0-9;]*m/g, ''));
+  assert.equal(lines[1].indexOf('y'), lines[2].indexOf('w'));
+});
+
+test('usageCmd refreshes expired tokens and persists before the usage call', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  const expired = JSON.stringify({ claudeAiOauth: { accessToken: 'at-old', refreshToken: 'rt-old', expiresAt: 1 } });
+  saveProfile('work', { credentials: expired, oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  let persistedAtUsageTime = null;
+  const fetchImpl = async (url, init) => {
+    if (url.includes('/oauth/token')) {
+      return { ok: true, status: 200, json: async () => ({ access_token: 'at-new', refresh_token: 'rt-new', expires_in: 28800 }) };
+    }
+    persistedAtUsageTime = JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.accessToken;
+    assert.equal(init.headers.Authorization, 'Bearer at-new');
+    return { ok: true, status: 200, json: async () => ({ five_hour: { utilization: 10, resets_at: null } }) };
+  };
+  const lines = captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.equal(persistedAtUsageTime, 'at-new'); // persist-before-use
+  assert.match(lines.join('\n'), /ok \(refreshed\)/);
+});
+
+test('usageCmd uses live credentials for the active profile without refreshing', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  const stale = JSON.stringify({ claudeAiOauth: { accessToken: 'at-stale', refreshToken: 'rt-1', expiresAt: 1 } });
+  saveProfile('work', { credentials: stale, oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  setActive('work', cfg);
+  writeCredentials(
+    JSON.stringify({ claudeAiOauth: { accessToken: 'at-live', refreshToken: 'rt-2', expiresAt: Date.now() + 3600000 } }),
+    cfg,
+  );
+  const urls = [];
+  const fetchImpl = async (url, init) => {
+    urls.push(url);
+    assert.equal(init.headers.Authorization, 'Bearer at-live');
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.equal(urls.length, 1); // usage only, no token refresh
+});
+
+test('usageCmd fails soft per profile and only exits 1 when all fail', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  const good = JSON.stringify({ claudeAiOauth: { accessToken: 'at-ok', refreshToken: 'rt', expiresAt: Date.now() + 3600000 } });
+  const dead = JSON.stringify({ claudeAiOauth: { accessToken: 'at-dead', refreshToken: 'rt-dead', expiresAt: 1 } });
+  saveProfile('good', { credentials: good, oauthAccount: {} }, cfg);
+  saveProfile('dead', { credentials: dead, oauthAccount: {} }, cfg);
+  const fetchImpl = async (url) => {
+    if (url.includes('/oauth/token')) return { ok: false, status: 400, json: async () => ({}) };
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  const lines = captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.match(lines.join('\n'), /logged out — run "ccswitch login dead"/);
+  deleteProfileFile('good', cfg);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
+});
+
+test('usageCmd --dry-run touches the network never', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: {} }, cfg);
+  const lines = captureLog(t);
+  assert.equal(
+    await usageCmd({ dryRun: true }, cfg, async () => {
+      throw new Error('network hit');
+    }),
+    0,
+  );
+  assert.match(lines.join('\n'), /\[dry-run\]/);
+});
+
+test('main routes "usage" (dry-run) and help mentions it', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: {} }, cfg);
+  const lines = captureLog(t);
+  assert.equal(await main(['--dry-run', 'usage']), 0);
+  assert.match(lines.join('\n'), /would query usage for "work"/);
+  lines.length = 0;
+  await main(['--help']);
+  assert.match(lines.join('\n'), /ccswitch usage/);
 });

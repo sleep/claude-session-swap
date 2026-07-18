@@ -7,7 +7,9 @@
 // Zero dependencies by design: this tool handles OAuth refresh tokens, so
 // every third-party package would be supply-chain attack surface.
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { Writable } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
@@ -132,6 +134,112 @@ export function updateOauthAccount(oauthAccount, cfg = config()) {
   fs.renameSync(tmp, cfg.claudeJson);
 }
 
+// --- Encryption at rest (opt-in) -------------------------------------------------
+// scrypt-derived key + AES-256-GCM via node:crypto, keeping the zero-dependency
+// design. Applies to profiles, backups and exports — never to the live
+// ~/.claude/.credentials.json, which Claude Code must read as plaintext.
+
+const SCRYPT = { N: 1 << 15, r: 8, p: 1, maxmem: 128 * 1024 * 1024 };
+
+export function encryptText(plain, passphrase) {
+  const salt = crypto.randomBytes(16);
+  const key = crypto.scryptSync(passphrase, salt, 32, SCRYPT);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const data = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
+  return JSON.stringify(
+    {
+      ccswitchEncrypted: 1,
+      kdf: 'scrypt',
+      N: SCRYPT.N,
+      r: SCRYPT.r,
+      p: SCRYPT.p,
+      salt: salt.toString('base64'),
+      iv: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+      data: data.toString('base64'),
+    },
+    null,
+    2,
+  );
+}
+
+export function decryptText(raw, passphrase) {
+  const env_ = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const key = crypto.scryptSync(passphrase, Buffer.from(env_.salt, 'base64'), 32, {
+    N: env_.N, r: env_.r, p: env_.p, maxmem: SCRYPT.maxmem,
+  });
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(env_.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(env_.tag, 'base64'));
+  try {
+    return Buffer.concat([decipher.update(Buffer.from(env_.data, 'base64')), decipher.final()]).toString('utf8');
+  } catch {
+    throw new UsageError('wrong passphrase (or corrupted encrypted file)');
+  }
+}
+
+export function isEncrypted(raw) {
+  try {
+    return JSON.parse(raw)?.ccswitchEncrypted === 1;
+  } catch {
+    return false;
+  }
+}
+
+// The passphrase is resolved once per invocation (CCSWITCH_PASSPHRASE, or an
+// interactive prompt in main) and cached so the sync file helpers can use it.
+let passphraseCache = null;
+
+export function setPassphrase(p) {
+  passphraseCache = p;
+}
+
+function mustPassphrase() {
+  const p = passphraseCache ?? process.env.CCSWITCH_PASSPHRASE;
+  if (!p) throw new UsageError('this store is encrypted; set CCSWITCH_PASSPHRASE or run interactively');
+  return p;
+}
+
+async function promptHidden(question) {
+  process.stdout.write(question);
+  const muted = new Writable({ write(chunk, enc, cb) { cb(); } });
+  const rl = readline.createInterface({ input: process.stdin, output: muted, terminal: true });
+  try {
+    const answer = await rl.question('');
+    process.stdout.write('\n');
+    return answer.trim();
+  } finally {
+    rl.close();
+  }
+}
+
+export async function requirePassphrase({ confirm = false } = {}) {
+  const preset = passphraseCache ?? process.env.CCSWITCH_PASSPHRASE;
+  if (preset) {
+    passphraseCache = preset;
+    return preset;
+  }
+  if (!process.stdin.isTTY) {
+    throw new UsageError('this store is encrypted; set CCSWITCH_PASSPHRASE or run interactively');
+  }
+  const p = await promptHidden('Passphrase: ');
+  if (!p) throw new UsageError('empty passphrase');
+  if (confirm && (await promptHidden('Repeat passphrase: ')) !== p) {
+    throw new UsageError('passphrases do not match');
+  }
+  passphraseCache = p;
+  return p;
+}
+
+// Wrap/unwrap a JSON body according to the store's encryption flag.
+function sealBody(body, cfg) {
+  return storeEncrypted(cfg) ? encryptText(body, mustPassphrase()) : body;
+}
+
+function openBody(raw) {
+  return isEncrypted(raw) ? decryptText(raw, mustPassphrase()) : raw;
+}
+
 // --- Profile store -------------------------------------------------------------
 
 function profilePath(name, cfg) {
@@ -142,13 +250,13 @@ export function saveProfile(name, { credentials, oauthAccount, savedAt }, cfg = 
   validateName(name);
   ensureHome(cfg);
   const body = JSON.stringify({ credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString() }, null, 2);
-  fs.writeFileSync(profilePath(name, cfg), body, { mode: 0o600 });
+  fs.writeFileSync(profilePath(name, cfg), sealBody(body, cfg), { mode: 0o600 });
 }
 
 export function loadProfile(name, cfg = config()) {
   validateName(name);
   try {
-    return JSON.parse(fs.readFileSync(profilePath(name, cfg), 'utf8'));
+    return JSON.parse(openBody(fs.readFileSync(profilePath(name, cfg), 'utf8')));
   } catch (err) {
     if (err.code === 'ENOENT') {
       throw new UsageError(`no profile named "${name}" (run "ccswitch list")`);
@@ -175,7 +283,7 @@ export function listProfiles(cfg = config()) {
     .sort()
     .map((f) => ({
       name: f.slice(0, -'.json'.length),
-      ...JSON.parse(fs.readFileSync(path.join(cfg.home, 'profiles', f), 'utf8')),
+      ...JSON.parse(openBody(fs.readFileSync(path.join(cfg.home, 'profiles', f), 'utf8'))),
     }));
 }
 
@@ -186,27 +294,39 @@ export function deleteProfileFile(name, cfg = config()) {
   fs.rmSync(path.join(cfg.home, 'dirs', name), { recursive: true, force: true });
 }
 
-export function getActive(cfg = config()) {
+function readState(cfg) {
   try {
-    return JSON.parse(fs.readFileSync(path.join(cfg.home, 'state.json'), 'utf8')).active ?? null;
+    return JSON.parse(fs.readFileSync(path.join(cfg.home, 'state.json'), 'utf8'));
   } catch (err) {
-    if (err.code === 'ENOENT') return null;
+    if (err.code === 'ENOENT') return {};
     throw err;
   }
 }
 
-export function setActive(name, cfg = config()) {
+function writeState(patch, cfg) {
   ensureHome(cfg);
-  fs.writeFileSync(path.join(cfg.home, 'state.json'), JSON.stringify({ active: name }, null, 2), {
+  fs.writeFileSync(path.join(cfg.home, 'state.json'), JSON.stringify({ ...readState(cfg), ...patch }, null, 2), {
     mode: 0o600,
   });
+}
+
+export function getActive(cfg = config()) {
+  return readState(cfg).active ?? null;
+}
+
+export function setActive(name, cfg = config()) {
+  writeState({ active: name }, cfg);
+}
+
+export function storeEncrypted(cfg = config()) {
+  return readState(cfg).encrypted === true;
 }
 
 export function writeBackup(reason, payload, cfg = config()) {
   ensureHome(cfg);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const file = path.join(cfg.home, 'backups', `${stamp}-${reason}.json`);
-  fs.writeFileSync(file, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  fs.writeFileSync(file, sealBody(JSON.stringify(payload, null, 2), cfg), { mode: 0o600 });
   return file;
 }
 
@@ -452,8 +572,12 @@ export function exportProfile(name, dest, { force = false, dryRun = false } = {}
     null,
     2,
   );
-  fs.writeFileSync(out, body, { mode: 0o600 });
-  console.log(`exported "${name}" to ${out} (plaintext — it holds live tokens, so guard it)`);
+  fs.writeFileSync(out, sealBody(body, cfg), { mode: 0o600 });
+  console.log(
+    storeEncrypted(cfg)
+      ? `exported "${name}" to ${out} (encrypted with your store passphrase)`
+      : `exported "${name}" to ${out} (plaintext — it holds live tokens, so guard it)`,
+  );
   return out;
 }
 
@@ -469,8 +593,9 @@ export function importProfile(name, src, { force = false, dryRun = false } = {},
   }
   let parsed;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
+    parsed = JSON.parse(openBody(raw));
+  } catch (err) {
+    if (err instanceof UsageError) throw err;
     throw new UsageError(`${from} is not valid JSON`);
   }
   if (!parsed || typeof parsed !== 'object' || !('credentials' in parsed)) {
@@ -485,6 +610,33 @@ export function importProfile(name, src, { force = false, dryRun = false } = {},
   }
   saveProfile(name, { credentials: parsed.credentials ?? null, oauthAccount: parsed.oauthAccount ?? null }, cfg);
   console.log(`imported profile "${name}" from ${from} (${parsed.oauthAccount?.emailAddress ?? 'unknown email'})`);
+}
+
+// --- Encrypt / decrypt the store (migration) ------------------------------------
+
+export function setStoreEncryption(enabled, cfg = config()) {
+  if (storeEncrypted(cfg) === enabled) {
+    throw new UsageError(`store is already ${enabled ? 'encrypted' : 'decrypted'}`);
+  }
+  if (enabled) mustPassphrase(); // fail before flipping the flag, not mid-rewrite
+  // Read everything while the current flag still matches the on-disk format.
+  const profiles = listProfiles(cfg);
+  const backupsDir = path.join(cfg.home, 'backups');
+  let backups = [];
+  try {
+    backups = fs
+      .readdirSync(backupsDir)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => ({ file: path.join(backupsDir, f), body: openBody(fs.readFileSync(path.join(backupsDir, f), 'utf8')) }));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  writeState({ encrypted: enabled }, cfg);
+  for (const p of profiles) saveProfile(p.name, p, cfg);
+  for (const b of backups) fs.writeFileSync(b.file, enabled ? encryptText(b.body, mustPassphrase()) : b.body, { mode: 0o600 });
+  console.log(
+    `${enabled ? 'encrypted' : 'decrypted'} ${profiles.length} profile(s) and ${backups.length} backup(s) in ${cfg.home}`,
+  );
 }
 
 // --- Whole-store export / import ------------------------------------------------
@@ -513,9 +665,11 @@ export function exportAll(dest, { force = false, dryRun = false } = {}, cfg = co
     null,
     2,
   );
-  fs.writeFileSync(out, body, { mode: 0o600 });
+  fs.writeFileSync(out, sealBody(body, cfg), { mode: 0o600 });
   console.log(
-    `exported ${Object.keys(profiles).length} profile(s) to ${out} (plaintext — it holds live tokens, so guard it)`,
+    storeEncrypted(cfg)
+      ? `exported ${Object.keys(profiles).length} profile(s) to ${out} (encrypted with your store passphrase)`
+      : `exported ${Object.keys(profiles).length} profile(s) to ${out} (plaintext — it holds live tokens, so guard it)`,
   );
   return out;
 }
@@ -531,8 +685,9 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
   }
   let parsed;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
+    parsed = JSON.parse(openBody(raw));
+  } catch (err) {
+    if (err instanceof UsageError) throw err;
     throw new UsageError(`${from} is not valid JSON`);
   }
   if (parsed?.ccswitchExport !== 1 || typeof parsed.profiles !== 'object' || parsed.profiles === null) {
@@ -636,9 +791,12 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch import <name> [file] load a profile from such a file (--force overwrites)
   ccswitch export-all [file]    write ALL profiles + active pointer to one file (default ccswitch-all.ccswitch.json)
   ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
+  ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
+  ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
 
 State lives in ~/.claude-profiles. Every mutation writes a backup there first.
-Exported files hold tokens in plaintext; move them over a trusted channel.`;
+Unencrypted stores keep tokens in plaintext; run "ccswitch encrypt" to protect
+them at rest. CCSWITCH_PASSPHRASE skips the interactive passphrase prompt.`;
 
 function requireName(name) {
   if (!name) throw new UsageError('missing profile name (see ccswitch --help)');
@@ -674,6 +832,23 @@ export async function main(argv = process.argv.slice(2)) {
   if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
     console.log(HELP);
     return 0;
+  }
+  // Resolve the passphrase up front whenever this invocation will need to
+  // open sealed data: an encrypted store, or an encrypted import file.
+  const fileIsEncrypted = (p) => {
+    try {
+      return isEncrypted(fs.readFileSync(p, 'utf8'));
+    } catch {
+      return false;
+    }
+  };
+  const pos = rest.filter((a) => a !== '--force');
+  const importSrc =
+    cmd === 'import' ? (pos[1] ?? (pos[0] ? `${pos[0]}.ccswitch.json` : null))
+    : cmd === 'import-all' ? (pos[0] ?? 'ccswitch-all.ccswitch.json')
+    : null;
+  if (storeEncrypted(cfg) || (importSrc && fileIsEncrypted(importSrc))) {
+    await requirePassphrase();
   }
   if (!cmd) {
     switchTo(await pickProfile(cfg), { dryRun }, cfg);
@@ -713,6 +888,25 @@ export async function main(argv = process.argv.slice(2)) {
     case 'import-all': {
       const pos = rest.filter((a) => a !== '--force');
       importAll(pos[0], { force: rest.includes('--force'), dryRun }, cfg);
+      return 0;
+    }
+    case 'encrypt': {
+      if (storeEncrypted(cfg)) throw new UsageError('store is already encrypted');
+      if (dryRun) {
+        console.log('[dry-run] would encrypt all profiles and backups with a passphrase');
+        return 0;
+      }
+      await requirePassphrase({ confirm: true });
+      setStoreEncryption(true, cfg);
+      return 0;
+    }
+    case 'decrypt': {
+      if (!storeEncrypted(cfg)) throw new UsageError('store is not encrypted');
+      if (dryRun) {
+        console.log('[dry-run] would rewrite all profiles and backups as plaintext');
+        return 0;
+      }
+      setStoreEncryption(false, cfg);
       return 0;
     }
     case 'run': {

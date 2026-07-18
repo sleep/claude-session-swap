@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, main } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -622,6 +622,109 @@ test('saveBackRunDir skips a mismatched account and an empty run dir', (t) => {
   fs.rmSync(path.join(dir, '.credentials.json'));
   saveBackRunDir('work', dir, cfg);
   assert.equal(loadProfile('work', cfg).credentials, '{"tok":"w"}');
+});
+
+test('encryptText/decryptText round-trip; wrong passphrase and tampering fail', () => {
+  const sealed = encryptText('{"secret":"tok"}', 'pw');
+  assert.equal(isEncrypted(sealed), true);
+  assert.doesNotMatch(sealed, /tok/);
+  assert.equal(decryptText(sealed, 'pw'), '{"secret":"tok"}');
+  assert.throws(() => decryptText(sealed, 'nope'), /wrong passphrase/);
+  const tampered = JSON.parse(sealed);
+  tampered.data = Buffer.from('xx').toString('base64');
+  assert.throws(() => decryptText(tampered, 'pw'), /wrong passphrase|corrupted/);
+});
+
+test('encrypting the store seals profiles and backups; decrypt restores plaintext', (t) => {
+  sandbox(t);
+  t.after(() => setPassphrase(null));
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"secret-w"}', oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  writeBackup('test', { credentials: '{"tok":"secret-b"}' }, cfg);
+  setPassphrase('pw');
+
+  setStoreEncryption(true, cfg);
+
+  assert.equal(storeEncrypted(cfg), true);
+  const rawProfile = fs.readFileSync(path.join(cfg.home, 'profiles', 'work.json'), 'utf8');
+  assert.equal(isEncrypted(rawProfile), true);
+  assert.doesNotMatch(rawProfile, /secret-w/); // no plaintext token on disk
+  const backupFile = fs.readdirSync(path.join(cfg.home, 'backups'))[0];
+  assert.doesNotMatch(fs.readFileSync(path.join(cfg.home, 'backups', backupFile), 'utf8'), /secret-b/);
+  // Reads still work transparently, including new writes:
+  assert.equal(loadProfile('work', cfg).credentials, '{"tok":"secret-w"}');
+  saveProfile('new', { credentials: '{"tok":"secret-n"}', oauthAccount: null }, cfg);
+  assert.doesNotMatch(fs.readFileSync(path.join(cfg.home, 'profiles', 'new.json'), 'utf8'), /secret-n/);
+  assert.match(formatList(cfg), /work +w@x\.com/);
+  assert.throws(() => setStoreEncryption(true, cfg), /already encrypted/);
+
+  setStoreEncryption(false, cfg);
+  assert.equal(storeEncrypted(cfg), false);
+  assert.match(fs.readFileSync(path.join(cfg.home, 'profiles', 'work.json'), 'utf8'), /secret-w/);
+  assert.equal(loadProfile('new', cfg).credentials, '{"tok":"secret-n"}');
+});
+
+test('reading an encrypted store without a passphrase fails cleanly', (t) => {
+  sandbox(t);
+  t.after(() => setPassphrase(null));
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"w"}', oauthAccount: null }, cfg);
+  setPassphrase('pw');
+  setStoreEncryption(true, cfg);
+  setPassphrase(null);
+  assert.throws(() => loadProfile('work', cfg), /set CCSWITCH_PASSPHRASE/);
+  setPassphrase('wrong');
+  assert.throws(() => loadProfile('work', cfg), /wrong passphrase/);
+});
+
+test('encrypted store produces encrypted exports that import back', (t) => {
+  const { home } = sandbox(t);
+  t.after(() => setPassphrase(null));
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"secret-w"}', oauthAccount: null }, cfg);
+  setPassphrase('pw');
+  setStoreEncryption(true, cfg);
+
+  const one = exportProfile('work', path.join(home, 'one.json'), {}, cfg);
+  assert.equal(isEncrypted(fs.readFileSync(one, 'utf8')), true);
+  importProfile('work-copy', one, {}, cfg);
+  assert.equal(loadProfile('work-copy', cfg).credentials, '{"tok":"secret-w"}');
+
+  const all = exportAll(path.join(home, 'all.json'), {}, cfg);
+  assert.equal(isEncrypted(fs.readFileSync(all, 'utf8')), true);
+  // Import into a fresh plaintext store, same passphrase for the file:
+  process.env.CCSWITCH_HOME = path.join(home, 'second-home');
+  const cfg2 = config();
+  importAll(all, {}, cfg2);
+  assert.equal(loadProfile('work', cfg2).credentials, '{"tok":"secret-w"}');
+  assert.equal(isEncrypted(fs.readFileSync(path.join(cfg2.home, 'profiles', 'work.json'), 'utf8')), false); // target store is plaintext
+});
+
+test('cli: encrypt via CCSWITCH_PASSPHRASE, list works, decrypt restores', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"secret-w"}', oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const env = {
+    CCSWITCH_HOME: process.env.CCSWITCH_HOME,
+    CCSWITCH_CLAUDE_JSON: process.env.CCSWITCH_CLAUDE_JSON,
+    CCSWITCH_KEYCHAIN_SERVICE: process.env.CCSWITCH_KEYCHAIN_SERVICE,
+    CCSWITCH_PASSPHRASE: 'pw',
+  };
+  const enc = runCli(['encrypt'], env);
+  assert.equal(enc.status, 0, enc.stderr);
+  assert.equal(isEncrypted(fs.readFileSync(path.join(cfg.home, 'profiles', 'work.json'), 'utf8')), true);
+
+  const list = runCli(['list'], env);
+  assert.equal(list.status, 0, list.stderr);
+  assert.match(list.stdout, /work +w@x\.com/);
+
+  const noPw = runCli(['list'], { ...env, CCSWITCH_PASSPHRASE: '' });
+  assert.equal(noPw.status, 1);
+  assert.match(noPw.stderr, /CCSWITCH_PASSPHRASE/);
+
+  const dec = runCli(['decrypt'], env);
+  assert.equal(dec.status, 0, dec.stderr);
+  assert.match(fs.readFileSync(path.join(cfg.home, 'profiles', 'work.json'), 'utf8'), /secret-w/);
 });
 
 const CLI = new URL('../ccswitch.mjs', import.meta.url).pathname;

@@ -33,6 +33,8 @@ ccswitch export <name> [file] write a profile to a plaintext file (default <name
 ccswitch import <name> [file] load a profile from such a file (--force overwrites)
 ccswitch export-all [file]    write ALL profiles + active pointer to one file (default ccswitch-all.ccswitch.json)
 ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
+ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
+ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
 ```
 
 Every command accepts `--dry-run` to print what it would do without touching anything.
@@ -76,7 +78,16 @@ ccswitch import-all ccswitch-all.ccswitch.json
 
 `import-all` merges: profiles that already exist on the target machine are skipped (pass `--force` to overwrite them), and the exported active pointer is only adopted if the target has no active profile. Backups and per-profile run dirs are machine-local and not included.
 
-Exported files hold live tokens in plaintext — treat them like passwords.
+Exported files hold live tokens in plaintext — treat them like passwords (or encrypt the store first, below).
+
+### Encryption at rest (opt-in)
+
+```sh
+ccswitch encrypt   # prompts for a passphrase (twice) and seals the store
+ccswitch decrypt   # rewrites everything back to plaintext
+```
+
+Once encrypted, profiles, backups and any new exports are sealed with scrypt-derived AES-256-GCM (`node:crypto`, still zero dependencies). Commands that need to read the store prompt for the passphrase; set `CCSWITCH_PASSPHRASE` to skip the prompt in scripts. The live `~/.claude/.credentials.json` is **never** encrypted — Claude Code must read it as plaintext, so the active account's tokens are always exposed to your user account regardless. Encrypted exports can be imported on another machine with the same passphrase, even into an unencrypted store.
 
 ## How it works
 

@@ -138,10 +138,10 @@ function profilePath(name, cfg) {
   return path.join(cfg.home, 'profiles', `${name}.json`);
 }
 
-export function saveProfile(name, { credentials, oauthAccount }, cfg = config()) {
+export function saveProfile(name, { credentials, oauthAccount, savedAt }, cfg = config()) {
   validateName(name);
   ensureHome(cfg);
-  const body = JSON.stringify({ credentials, oauthAccount, savedAt: new Date().toISOString() }, null, 2);
+  const body = JSON.stringify({ credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString() }, null, 2);
   fs.writeFileSync(profilePath(name, cfg), body, { mode: 0o600 });
 }
 
@@ -487,6 +487,81 @@ export function importProfile(name, src, { force = false, dryRun = false } = {},
   console.log(`imported profile "${name}" from ${from} (${parsed.oauthAccount?.emailAddress ?? 'unknown email'})`);
 }
 
+// --- Whole-store export / import ------------------------------------------------
+// Bundles every profile plus the active pointer into one plaintext file, for
+// moving the whole store between machines. Backups and run dirs stay local:
+// backups are point-in-time recovery data, run dirs are regenerated on demand.
+
+export function exportAll(dest, { force = false, dryRun = false } = {}, cfg = config()) {
+  const out = dest ?? 'ccswitch-all.ccswitch.json';
+  const profiles = {};
+  for (const p of listProfiles(cfg)) {
+    profiles[p.name] = { credentials: p.credentials ?? null, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt ?? null };
+  }
+  if (Object.keys(profiles).length === 0) {
+    throw new UsageError('no profiles to export — save one with "ccswitch save <name>" first');
+  }
+  if (dryRun) {
+    console.log(`[dry-run] would write ${Object.keys(profiles).length} profile(s) to ${out}`);
+    return out;
+  }
+  if (fs.existsSync(out) && !force) {
+    throw new UsageError(`${out} already exists; pass --force to overwrite`);
+  }
+  const body = JSON.stringify(
+    { ccswitchExport: 1, exportedAt: new Date().toISOString(), active: getActive(cfg), profiles },
+    null,
+    2,
+  );
+  fs.writeFileSync(out, body, { mode: 0o600 });
+  console.log(
+    `exported ${Object.keys(profiles).length} profile(s) to ${out} (plaintext — it holds live tokens, so guard it)`,
+  );
+  return out;
+}
+
+export function importAll(src, { force = false, dryRun = false } = {}, cfg = config()) {
+  const from = src ?? 'ccswitch-all.ccswitch.json';
+  let raw;
+  try {
+    raw = fs.readFileSync(from, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') throw new UsageError(`no file to import at ${from}`);
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new UsageError(`${from} is not valid JSON`);
+  }
+  if (parsed?.ccswitchExport !== 1 || typeof parsed.profiles !== 'object' || parsed.profiles === null) {
+    throw new UsageError(`${from} is not a ccswitch full export (missing "ccswitchExport"/"profiles")`);
+  }
+  const names = Object.keys(parsed.profiles);
+  for (const name of names) validateName(name); // reject the whole file before writing anything
+  if (dryRun) {
+    console.log(`[dry-run] would import ${names.length} profile(s) from ${from}: ${names.join(', ')}`);
+    return;
+  }
+  let imported = 0;
+  for (const name of names) {
+    if (profileExists(name, cfg) && !force) {
+      console.error(`skipping "${name}": profile already exists (pass --force to overwrite)`);
+      continue;
+    }
+    const p = parsed.profiles[name];
+    saveProfile(name, { credentials: p.credentials ?? null, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt ?? undefined }, cfg);
+    imported++;
+  }
+  // Adopt the exported active pointer only on a machine with no active profile,
+  // and only if that profile actually made it across.
+  if (!getActive(cfg) && parsed.active && profileExists(parsed.active, cfg)) {
+    setActive(parsed.active, cfg);
+  }
+  console.log(`imported ${imported} of ${names.length} profile(s) from ${from}`);
+}
+
 // --- Isolated run (no global mutation) -----------------------------------------
 
 export function materializeRunDir(name, cfg = config()) {
@@ -559,6 +634,8 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch delete <name>        delete a profile (--force skips confirmation)
   ccswitch export <name> [file] write a profile to a plaintext file (default <name>.ccswitch.json)
   ccswitch import <name> [file] load a profile from such a file (--force overwrites)
+  ccswitch export-all [file]    write ALL profiles + active pointer to one file (default ccswitch-all.ccswitch.json)
+  ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
 
 State lives in ~/.claude-profiles. Every mutation writes a backup there first.
 Exported files hold tokens in plaintext; move them over a trusted channel.`;
@@ -626,6 +703,16 @@ export async function main(argv = process.argv.slice(2)) {
     case 'import': {
       const pos = rest.filter((a) => a !== '--force');
       importProfile(requireName(pos[0]), pos[1], { force: rest.includes('--force'), dryRun }, cfg);
+      return 0;
+    }
+    case 'export-all': {
+      const pos = rest.filter((a) => a !== '--force');
+      exportAll(pos[0], { force: rest.includes('--force'), dryRun }, cfg);
+      return 0;
+    }
+    case 'import-all': {
+      const pos = rest.filter((a) => a !== '--force');
+      importAll(pos[0], { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     }
     case 'run': {

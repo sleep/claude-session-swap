@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, saveBackRunDir, main } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, main } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -476,6 +476,82 @@ test('cli: export then import round-trips across a fresh store', (t) => {
   const imp = runCli(['import', 'work-2', file], env);
   assert.equal(imp.status, 0);
   assert.equal(loadProfile('work-2', cfg).credentials, '{"tok":"w"}');
+});
+
+test('export-all/import-all round-trips the whole store', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"w"}', oauthAccount: { emailAddress: 'w@x.com' }, savedAt: '2026-01-01T00:00:00.000Z' }, cfg);
+  saveProfile('personal', { credentials: '{"tok":"p"}', oauthAccount: null }, cfg);
+  setActive('work', cfg);
+  const out = path.join(home, 'all.json');
+
+  exportAll(out, {}, cfg);
+  assert.equal(fs.statSync(out).mode & 0o777, 0o600);
+  const dumped = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(dumped.ccswitchExport, 1);
+  assert.equal(dumped.active, 'work');
+  assert.deepEqual(Object.keys(dumped.profiles).sort(), ['personal', 'work']);
+
+  // Import into a fresh store:
+  process.env.CCSWITCH_HOME = path.join(home, 'second-home');
+  const cfg2 = config();
+  importAll(out, {}, cfg2);
+  assert.equal(loadProfile('work', cfg2).credentials, '{"tok":"w"}');
+  assert.equal(loadProfile('work', cfg2).savedAt, '2026-01-01T00:00:00.000Z'); // preserved, not re-stamped
+  assert.equal(loadProfile('personal', cfg2).credentials, '{"tok":"p"}');
+  assert.equal(getActive(cfg2), 'work'); // adopted: fresh machine had no active profile
+});
+
+test('import-all merges: skips existing profiles without --force, keeps local active', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"local"}', oauthAccount: null }, cfg);
+  setActive('work', cfg);
+  const out = path.join(home, 'all.json');
+  fs.writeFileSync(out, JSON.stringify({
+    ccswitchExport: 1,
+    active: 'other',
+    profiles: {
+      work: { credentials: '{"tok":"remote"}', oauthAccount: null },
+      other: { credentials: '{"tok":"o"}', oauthAccount: null },
+    },
+  }));
+
+  importAll(out, {}, cfg);
+  assert.equal(loadProfile('work', cfg).credentials, '{"tok":"local"}'); // skipped
+  assert.equal(loadProfile('other', cfg).credentials, '{"tok":"o"}'); // added
+  assert.equal(getActive(cfg), 'work'); // local active pointer kept
+
+  importAll(out, { force: true }, cfg);
+  assert.equal(loadProfile('work', cfg).credentials, '{"tok":"remote"}'); // --force overwrites
+});
+
+test('export-all/import-all validate inputs and honor --dry-run', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  assert.throws(() => exportAll(path.join(home, 'x.json'), {}, cfg), /no profiles to export/);
+
+  saveProfile('work', { credentials: 'x', oauthAccount: null }, cfg);
+  const out = path.join(home, 'all.json');
+  exportAll(out, { dryRun: true }, cfg);
+  assert.equal(fs.existsSync(out), false);
+  fs.writeFileSync(out, 'preexisting');
+  assert.throws(() => exportAll(out, {}, cfg), /already exists/);
+
+  assert.throws(() => importAll(path.join(home, 'gone.json'), {}, cfg), /no file to import/);
+  const bad = path.join(home, 'bad.json');
+  fs.writeFileSync(bad, JSON.stringify({ profiles: {} })); // missing marker
+  assert.throws(() => importAll(bad, {}, cfg), /not a ccswitch full export/);
+  const evil = path.join(home, 'evil.json');
+  fs.writeFileSync(evil, JSON.stringify({ ccswitchExport: 1, profiles: { '../evil': { credentials: 'x' }, ok: { credentials: 'y' } } }));
+  assert.throws(() => importAll(evil, {}, cfg), UsageError);
+  assert.equal(profileExists('ok', cfg), false); // nothing written when any name is invalid
+
+  const good = path.join(home, 'good.json');
+  fs.writeFileSync(good, JSON.stringify({ ccswitchExport: 1, profiles: { fresh: { credentials: 'z' } } }));
+  importAll(good, { dryRun: true }, cfg);
+  assert.equal(profileExists('fresh', cfg), false);
 });
 
 test('materializeRunDir writes credentials and identity, preserves extras', (t) => {

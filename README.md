@@ -31,6 +31,8 @@ ccswitch list                 show saved profiles
 ccswitch delete <name>        delete a profile (--force skips confirmation)
 ccswitch export <name> [file] write a profile to a plaintext file (default <name>.ccswitch.json)
 ccswitch import <name> [file] load a profile from such a file (--force overwrites)
+ccswitch export-all [file]    write ALL profiles + active pointer to one file (default ccswitch-all.ccswitch.json)
+ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
 ```
 
 Every command accepts `--dry-run` to print what it would do without touching anything.
@@ -63,6 +65,16 @@ ccswitch export work            # writes work.ccswitch.json
 # copy it over a trusted channel, then on the other machine:
 ccswitch import work work.ccswitch.json
 ```
+
+To move everything at once, use the whole-store variants:
+
+```sh
+ccswitch export-all             # writes ccswitch-all.ccswitch.json
+# copy it over a trusted channel, then on the other machine:
+ccswitch import-all ccswitch-all.ccswitch.json
+```
+
+`import-all` merges: profiles that already exist on the target machine are skipped (pass `--force` to overwrite them), and the exported active pointer is only adopted if the target has no active profile. Backups and per-profile run dirs are machine-local and not included.
 
 Exported files hold live tokens in plaintext — treat them like passwords.
 

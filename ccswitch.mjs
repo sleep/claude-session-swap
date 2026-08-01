@@ -509,10 +509,14 @@ export function saveCurrent(name, { force = false, dryRun = false } = {}, cfg = 
 
 // --- Guided login -----------------------------------------------------------------
 
-export async function login(name, { dryRun = false } = {}, cfg = config()) {
+export async function login(name, { force = false, dryRun = false } = {}, cfg = config()) {
   validateName(name);
-  if (profileExists(name, cfg)) {
-    throw new UsageError(`profile "${name}" already exists; use "ccswitch ${name}" or delete it first`);
+  // A moved profile is just a tombstone, so logging back into it needs no --force.
+  const existing = profileExists(name, cfg) ? loadProfile(name, cfg) : null;
+  if (existing && !existing.movedAt && !force) {
+    throw new UsageError(
+      `profile "${name}" already exists; use "ccswitch ${name}" to switch to it, or pass --force to re-login and replace it`,
+    );
   }
   if (dryRun) {
     console.log(
@@ -524,6 +528,7 @@ export async function login(name, { dryRun = false } = {}, cfg = config()) {
   const live = captureLive(cfg);
   const active = getActive(cfg);
   writeBackup(`login-${name}`, live, cfg);
+  if (existing) writeBackup(`login-replace-${name}`, existing, cfg);
   if (live.credentials) {
     if (active) {
       if (profileExists(active, cfg) && sameAccount(live.oauthAccount, loadProfile(active, cfg).oauthAccount)) {
@@ -1023,7 +1028,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       usage = await fetchUsage(credentials, fetchImpl);
       succeeded++;
     } catch (err) {
-      status = err instanceof AuthDeadError ? `logged out — run "ccswitch login ${p.name}"` : `error: ${err.message}`;
+      status = err instanceof AuthDeadError ? `logged out — run "ccswitch login ${p.name} --force"` : `error: ${err.message}`;
     }
     rows.push([
       isActive ? '*' : ' ',
@@ -1047,7 +1052,7 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch                      pick a profile interactively and switch to it
   ccswitch <name>               switch to profile <name>
   ccswitch switch <name>        same as above
-  ccswitch login <name>         log a new account in and save it as <name>
+  ccswitch login <name>         log a new account in and save it as <name> (--force re-logs into an existing profile)
   ccswitch save <name>          save the current login as <name> (--force overwrites)
   ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
   ccswitch list                 show saved profiles
@@ -1129,7 +1134,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   switch (cmd) {
     case 'login':
-      await login(requireName(rest[0]), { dryRun }, cfg);
+      await login(requireName(rest.find((a) => a !== '--force')), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'save':
       saveCurrent(requireName(rest.find((a) => a !== '--force')), { force: rest.includes('--force'), dryRun }, cfg);

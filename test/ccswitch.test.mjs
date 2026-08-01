@@ -366,11 +366,61 @@ test('aborted login restores the previous account', async (t) => {
   assert.equal(profileExists('second', cfg), false);
 });
 
-test('login refuses an existing profile name', async (t) => {
+test('login refuses an existing profile name without --force', async (t) => {
   sandbox(t);
   const cfg = config();
   saveProfile('work', { credentials: 'x', oauthAccount: null }, cfg);
-  await assert.rejects(() => login('work', {}, cfg), UsageError);
+  await assert.rejects(() => login('work', {}, cfg), /already exists.*--force/);
+});
+
+test('login --force re-logs into an existing profile and backs it up first', async (t) => {
+  const { home } = sandbox(t);
+  t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
+  fakeClaudeBin(
+    home,
+    `printf '%s' '{"tok":"fresh"}' > "$CCSWITCH_CREDENTIALS_FILE"\n` +
+      `printf '%s' '{"oauthAccount":{"emailAddress":"beta@x.com"}}' > "$CCSWITCH_CLAUDE_JSON"\n`,
+  );
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  seedTwoProfiles(cfg); // live = alpha (refreshed), active = alpha
+
+  await login('beta', { force: true }, cfg);
+
+  assert.equal(getActive(cfg), 'beta');
+  assert.equal(loadProfile('beta', cfg).credentials, '{"tok":"fresh"}');
+  // Outgoing live creds were stashed back into the previously active profile:
+  assert.equal(loadProfile('alpha', cfg).credentials, '{"tok":"alpha-refreshed"}');
+  // The replaced profile was backed up before being overwritten:
+  const backups = fs.readdirSync(path.join(cfg.home, 'backups'));
+  const match = backups.find((f) => /login-replace-beta\.json$/.test(f));
+  assert.ok(match, `expected a login-replace-beta backup, got: ${backups.join(', ')}`);
+  const backup = JSON.parse(fs.readFileSync(path.join(cfg.home, 'backups', match), 'utf8'));
+  assert.equal(backup.credentials, '{"tok":"beta"}');
+});
+
+test('login revives a moved profile without --force and clears the tombstone', async (t) => {
+  const { home } = sandbox(t);
+  t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
+  fakeClaudeBin(
+    home,
+    `printf '%s' '{"tok":"fresh"}' > "$CCSWITCH_CREDENTIALS_FILE"\n` +
+      `printf '%s' '{"oauthAccount":{"emailAddress":"work@x.com"}}' > "$CCSWITCH_CLAUDE_JSON"\n`,
+  );
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  saveProfile(
+    'work',
+    { credentials: '{"tok":"stale"}', oauthAccount: { emailAddress: 'work@x.com' }, movedAt: '2026-01-01T00:00:00.000Z' },
+    cfg,
+  );
+
+  await login('work', {}, cfg);
+
+  const revived = loadProfile('work', cfg);
+  assert.equal(revived.credentials, '{"tok":"fresh"}');
+  assert.equal(revived.movedAt, undefined);
+  assert.equal(getActive(cfg), 'work');
 });
 
 test('login restores previous state when claudeBin fails to spawn', async (t) => {
@@ -977,7 +1027,7 @@ test('usageCmd fails soft per profile and only exits 1 when all fail', async (t)
   };
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /logged out — run "ccswitch login dead"/);
+  assert.match(lines.join('\n'), /logged out — run "ccswitch login dead --force"/);
   deleteProfileFile('good', cfg);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
 });

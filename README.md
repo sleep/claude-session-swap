@@ -24,7 +24,7 @@ No dependencies to install — the tool is a single zero-dependency script by de
 ccswitch                      pick a profile interactively and switch to it
 ccswitch <name>               switch to profile <name>
 ccswitch switch <name>        same as above
-ccswitch login <name>         log a new account in and save it as <name>
+ccswitch login <name>         log a new account in and save it as <name> (--force re-logs into an existing profile)
 ccswitch save <name>          save the current login as <name> (--force overwrites)
 ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
 ccswitch list                 show saved profiles
@@ -69,7 +69,7 @@ ccswitch run work -- -p "summarize this repo"
   name      email             5h          resets    7d          resets    status
 * personal  me@gmail.com      ███▏   63%  in 2h04m  ▉      19%  in 5d21h  ok
   work      me@corp.com       ██▉    58%  in 3h27m  ████▏  84%  in 5d23h  ok (refreshed)
-  old       old@gmail.com     -           -         -           -         logged out — run "ccswitch login old"
+  old       old@gmail.com     -           -         -           -         logged out — run "ccswitch login old --force"
 ```
 
 It queries Anthropic's OAuth usage endpoint with each profile's stored token. Expired access tokens are refreshed first, and the rotated token pair is written back to the profile *before* it's used — so a crash can never lose a login. Valid tokens are never refreshed (no pointless rotation), and a profile whose chain is dead just shows `logged out` without breaking the others.

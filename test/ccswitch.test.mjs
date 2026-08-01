@@ -1007,3 +1007,146 @@ test('main routes "usage" (dry-run) and help mentions it', async (t) => {
   await main(['--help']);
   assert.match(lines.join('\n'), /ccswitch usage/);
 });
+
+// --- Multi-machine chain safety ---------------------------------------------------
+// OAuth refresh tokens rotate on every refresh, so a chain is only usable from
+// one machine. These tests pin the guardrails that keep two machines from
+// revoking each other's logins.
+
+test('export-all ships the live token chain for the active profile, not the stale snapshot', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  seedTwoProfiles(cfg); // live = alpha-refreshed, alpha profile file = stale
+  captureLog(t);
+  const out = path.join(home, 'all.json');
+  exportAll(out, {}, cfg);
+  const dumped = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(dumped.profiles.alpha.credentials, '{"tok":"alpha-refreshed"}');
+  assert.equal(dumped.profiles.beta.credentials, '{"tok":"beta"}');
+});
+
+test('export ships the live token chain when exporting the active profile', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  seedTwoProfiles(cfg);
+  captureLog(t);
+  const out = exportProfile('alpha', path.join(home, 'alpha.json'), {}, cfg);
+  assert.equal(JSON.parse(fs.readFileSync(out, 'utf8')).credentials, '{"tok":"alpha-refreshed"}');
+});
+
+test('export-all --move retires the exported profiles on this machine', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  seedTwoProfiles(cfg); // active = alpha, live login present
+  captureLog(t);
+  const out = path.join(home, 'all.json');
+  exportAll(out, { move: true }, cfg);
+  assert.ok(loadProfile('alpha', cfg).movedAt);
+  assert.ok(loadProfile('beta', cfg).movedAt);
+  assert.throws(() => switchTo('beta', {}, cfg), /moved/);
+  assert.throws(() => materializeRunDir('beta', cfg), /moved/);
+  // The active profile's chain was the live login: moving it logs this machine out.
+  assert.equal(readCredentials(cfg), null);
+  assert.equal(readClaudeJson(cfg).oauthAccount, undefined);
+  assert.equal(getActive(cfg), null);
+});
+
+test('export --move retires the profile locally', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  seedTwoProfiles(cfg);
+  captureLog(t);
+  exportProfile('beta', path.join(home, 'beta.json'), { move: true }, cfg);
+  assert.ok(loadProfile('beta', cfg).movedAt);
+  assert.throws(() => switchTo('beta', {}, cfg), /moved/);
+});
+
+test('a moved profile shows as moved in usage and is never refreshed', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile(
+    'gone',
+    {
+      credentials: JSON.stringify({ claudeAiOauth: { accessToken: 'at', refreshToken: 'rt', expiresAt: 1 } }),
+      oauthAccount: { emailAddress: 'g@x.com' },
+      movedAt: '2026-01-01T00:00:00.000Z',
+    },
+    cfg,
+  );
+  const lines = captureLog(t);
+  assert.equal(
+    await usageCmd({}, cfg, async () => {
+      throw new Error('network hit');
+    }),
+    1,
+  );
+  assert.match(lines.join('\n'), /moved to another machine/);
+});
+
+test('import-all keeps the live chain when an imported profile matches the live login', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  writeCredentials('{"tok":"mine-live"}', cfg);
+  fs.writeFileSync(cfg.claudeJson, JSON.stringify({ oauthAccount: { accountUuid: 'u-1', emailAddress: 'me@x.com' } }));
+  const out = path.join(home, 'all.json');
+  fs.writeFileSync(
+    out,
+    JSON.stringify({
+      ccswitchExport: 1,
+      active: null,
+      profiles: {
+        mine: { credentials: '{"tok":"foreign-copy"}', oauthAccount: { accountUuid: 'u-1', emailAddress: 'me@x.com' } },
+        other: { credentials: '{"tok":"o"}', oauthAccount: { accountUuid: 'u-2' } },
+      },
+    }),
+  );
+  captureLog(t);
+  importAll(out, {}, cfg);
+  assert.equal(loadProfile('mine', cfg).credentials, '{"tok":"mine-live"}'); // this machine's own chain wins
+  assert.equal(loadProfile('other', cfg).credentials, '{"tok":"o"}');
+});
+
+test('import keeps the live chain when the file matches the live login', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  writeCredentials('{"tok":"mine-live"}', cfg);
+  fs.writeFileSync(cfg.claudeJson, JSON.stringify({ oauthAccount: { accountUuid: 'u-1' } }));
+  const file = path.join(home, 'one.json');
+  fs.writeFileSync(file, JSON.stringify({ credentials: '{"tok":"foreign-copy"}', oauthAccount: { accountUuid: 'u-1' } }));
+  captureLog(t);
+  importProfile('mine', file, {}, cfg);
+  assert.equal(loadProfile('mine', cfg).credentials, '{"tok":"mine-live"}');
+});
+
+test('import-all restores a moved profile without --force', (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: '{"tok":"dead"}', oauthAccount: null, movedAt: '2026-01-01T00:00:00.000Z' }, cfg);
+  const out = path.join(home, 'all.json');
+  fs.writeFileSync(
+    out,
+    JSON.stringify({ ccswitchExport: 1, profiles: { work: { credentials: '{"tok":"fresh"}', oauthAccount: null } } }),
+  );
+  captureLog(t);
+  importAll(out, {}, cfg);
+  const p = loadProfile('work', cfg);
+  assert.equal(p.credentials, '{"tok":"fresh"}');
+  assert.equal(p.movedAt, undefined);
+});
+
+test('main routes export-all --move', async (t) => {
+  const { home } = sandbox(t);
+  const cfg = config();
+  t.after(() => deleteCredentials(cfg));
+  saveProfile('work', { credentials: '{"tok":"w"}', oauthAccount: null }, cfg);
+  const out = path.join(home, 'all.json');
+  captureLog(t);
+  assert.equal(await main(['export-all', out, '--move']), 0);
+  assert.ok(loadProfile('work', cfg).movedAt);
+});

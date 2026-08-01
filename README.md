@@ -30,9 +30,9 @@ ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch
 ccswitch list                 show saved profiles
 ccswitch usage                show 5h/7d quota for every profile (refreshes expired tokens)
 ccswitch delete <name>        delete a profile (--force skips confirmation)
-ccswitch export <name> [file] write a profile to a plaintext file (default <name>.ccswitch.json)
+ccswitch export <name> [file] write a profile to a plaintext file (--move retires it here)
 ccswitch import <name> [file] load a profile from such a file (--force overwrites)
-ccswitch export-all [file]    write ALL profiles + active pointer to one file (default ccswitch-all.ccswitch.json)
+ccswitch export-all [file]    write ALL profiles + active pointer to one file (--move retires them here)
 ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
 ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
 ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
@@ -74,27 +74,25 @@ ccswitch run work -- -p "summarize this repo"
 
 It queries Anthropic's OAuth usage endpoint with each profile's stored token. Expired access tokens are refreshed first, and the rotated token pair is written back to the profile *before* it's used — so a crash can never lose a login. Valid tokens are never refreshed (no pointless rotation), and a profile whose chain is dead just shows `logged out` without breaking the others.
 
-### Moving a profile to another machine
+### Using accounts on more than one machine
+
+The one rule: **a token chain works from exactly one machine.** OAuth refresh tokens rotate on every refresh, so the moment two machines hold the same chain, the first refresh strands the other machine's copy, and replaying a stranded chain makes Anthropic revoke the account's grant everywhere (that shows up as machines suddenly deauthorized). There are two safe setups:
+
+**Both machines in active use: log in separately on each.** Run `ccswitch login <name>` per account on the second machine. Each login creates an independent chain, and Anthropic keeps many chains alive per account, so machines logged in this way never log each other out. Never export a profile to a machine that is already using that account.
+
+**Migrating to a new machine: move, don't copy.**
 
 ```sh
-ccswitch export work            # writes work.ccswitch.json
-# copy it over a trusted channel, then on the other machine:
-ccswitch import work work.ccswitch.json
-```
-
-To move everything at once, use the whole-store variants:
-
-```sh
-ccswitch export-all             # writes ccswitch-all.ccswitch.json
+ccswitch export-all --move      # writes ccswitch-all.ccswitch.json, retires local copies
 # copy it over a trusted channel, then on the other machine:
 ccswitch import-all ccswitch-all.ccswitch.json
 ```
 
-`import-all` merges: profiles that already exist on the target machine are skipped (pass `--force` to overwrite them), and the exported active pointer is only adopted if the target has no active profile. Backups and per-profile run dirs are machine-local and not included.
+`--move` marks the exported profiles as moved on the source machine (and logs it out of the active one), so it can never refresh, and thereby revoke, a chain that now lives elsewhere. A moved profile refuses `switch`/`run`, shows as `moved` in `list` and `usage`, and can be revived by importing it back or with a fresh `ccswitch login`. Single profiles move the same way with `ccswitch export <name> --move` + `ccswitch import <name> <file>`.
+
+`import-all` merges: profiles that already exist on the target machine are skipped (pass `--force` to overwrite them; moved tombstones are overwritten without it), and the exported active pointer is only adopted if the target has no active profile. If an imported profile matches the login already live on the target machine, the machine's own chain is kept, since the imported copy would die on the source machine's next refresh anyway. Backups and per-profile run dirs are machine-local and not included.
 
 Exported files hold live tokens in plaintext — treat them like passwords (or encrypt the store first, below).
-
-**To use an account on a second machine, prefer `ccswitch login` there.** Each login creates its own independent token chain, and Anthropic happily keeps many chains alive per account — that's why two PCs logged in normally never log each other out. Export/import *moves* a login: if two machines share one exported chain, the first to refresh invalidates the other's copy.
 
 ### Encryption at rest (opt-in)
 

@@ -246,10 +246,14 @@ function profilePath(name, cfg) {
   return path.join(cfg.home, 'profiles', `${name}.json`);
 }
 
-export function saveProfile(name, { credentials, oauthAccount, savedAt }, cfg = config()) {
+export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt }, cfg = config()) {
   validateName(name);
   ensureHome(cfg);
-  const body = JSON.stringify({ credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString() }, null, 2);
+  const body = JSON.stringify(
+    { credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString(), ...(movedAt ? { movedAt } : {}) },
+    null,
+    2,
+  );
   fs.writeFileSync(profilePath(name, cfg), sealBody(body, cfg), { mode: 0o600 });
 }
 
@@ -347,6 +351,25 @@ function sameAccount(a, b) {
   return !ka || !kb || ka === kb;
 }
 
+// Import needs the opposite bias: only a definite identity match may let the
+// machine's own live chain override incoming credentials.
+function definitelySameAccount(a, b) {
+  const ka = a?.accountUuid ?? a?.emailAddress;
+  const kb = b?.accountUuid ?? b?.emailAddress;
+  return !!ka && !!kb && ka === kb;
+}
+
+// Token chains rotate on refresh, so a chain moved to another machine must
+// never be used from here again: replaying it revokes the account everywhere.
+function assertNotMoved(name, profile) {
+  if (profile.movedAt) {
+    throw new UsageError(
+      `profile "${name}" was moved to another machine on ${profile.movedAt}; ` +
+        `run "ccswitch login ${name}" for a fresh chain here, or import it back`,
+    );
+  }
+}
+
 export function warnIfClaudeRunning() {
   const r = spawnSync('pgrep', ['-x', 'claude'], { encoding: 'utf8' });
   if (r.status === 0) {
@@ -358,6 +381,7 @@ export function warnIfClaudeRunning() {
 
 export function switchTo(name, { dryRun = false } = {}, cfg = config()) {
   const profile = loadProfile(name, cfg);
+  assertNotMoved(name, profile);
   const active = getActive(cfg);
   const email = profile.oauthAccount?.emailAddress ?? 'unknown email';
   if (dryRun) {
@@ -416,7 +440,7 @@ export function formatList(cfg = config()) {
     p.name,
     p.oauthAccount?.emailAddress ?? '-',
     p.oauthAccount?.organizationRateLimitTier ?? '-',
-    tokenExpiry(p.credentials),
+    p.movedAt ? 'moved' : tokenExpiry(p.credentials),
     p.savedAt ?? '-',
   ]);
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => String(r[i]).length)));
@@ -557,18 +581,30 @@ function transferPath(name, given) {
   return given ?? `${name}.ccswitch.json`;
 }
 
-export function exportProfile(name, dest, { force = false, dryRun = false } = {}, cfg = config()) {
+export function exportProfile(name, dest, { force = false, move = false, dryRun = false } = {}, cfg = config()) {
   const profile = loadProfile(name, cfg); // throws UsageError if the profile is missing
+  assertNotMoved(name, profile); // its chain already lives elsewhere; exporting it would ship a dead chain
   const out = transferPath(name, dest);
   if (dryRun) {
-    console.log(`[dry-run] would write profile "${name}" to ${out}`);
+    console.log(`[dry-run] would write profile "${name}" to ${out}${move ? ' and retire it on this machine' : ''}`);
     return out;
   }
   if (fs.existsSync(out) && !force) {
     throw new UsageError(`${out} already exists; pass --force to overwrite`);
   }
+  // The active profile's freshest chain is the live one: claude refreshes it
+  // in place, and the profile file only catches up on the next switch.
+  let credentials = profile.credentials;
+  let tookLive = false;
+  if (name === getActive(cfg)) {
+    const live = captureLive(cfg);
+    if (live.credentials && sameAccount(live.oauthAccount, profile.oauthAccount)) {
+      credentials = live.credentials;
+      tookLive = true;
+    }
+  }
   const body = JSON.stringify(
-    { credentials: profile.credentials, oauthAccount: profile.oauthAccount, savedAt: profile.savedAt ?? null },
+    { credentials, oauthAccount: profile.oauthAccount, savedAt: profile.savedAt ?? null },
     null,
     2,
   );
@@ -576,9 +612,33 @@ export function exportProfile(name, dest, { force = false, dryRun = false } = {}
   console.log(
     storeEncrypted(cfg)
       ? `exported "${name}" to ${out} (encrypted with your store passphrase)`
-      : `exported "${name}" to ${out} (plaintext — it holds live tokens, so guard it)`,
+      : `exported "${name}" to ${out} (plaintext - it holds live tokens, so guard it)`,
   );
+  if (move) {
+    retireProfiles([{ name, credentials, oauthAccount: profile.oauthAccount, savedAt: profile.savedAt, tookLive }], cfg);
+  } else {
+    console.error(
+      'note: the exported chain stays active on this machine; pass --move if another machine will take it over (one chain used from two machines logs both out)',
+    );
+  }
   return out;
+}
+
+// Mark exported profiles as moved so this machine never refreshes their
+// chains again; when the live login went with the export, log it out here.
+function retireProfiles(entries, cfg) {
+  const movedAt = new Date().toISOString();
+  const active = getActive(cfg);
+  for (const e of entries) {
+    saveProfile(e.name, { credentials: e.credentials, oauthAccount: e.oauthAccount, savedAt: e.savedAt ?? undefined, movedAt }, cfg);
+  }
+  const activeEntry = entries.find((e) => e.name === active);
+  if (activeEntry?.tookLive) {
+    deleteCredentials(cfg);
+    updateOauthAccount(null, cfg);
+    setActive(null, cfg);
+    console.error(`this machine is now logged out of "${active}": its token chain moved with the export`);
+  }
 }
 
 export function importProfile(name, src, { force = false, dryRun = false } = {}, cfg = config()) {
@@ -601,15 +661,28 @@ export function importProfile(name, src, { force = false, dryRun = false } = {},
   if (!parsed || typeof parsed !== 'object' || !('credentials' in parsed)) {
     throw new UsageError(`${from} is not a ccswitch export (missing "credentials")`);
   }
-  if (profileExists(name, cfg) && !force) {
+  // A moved profile is just a tombstone, so restoring over it needs no --force.
+  if (profileExists(name, cfg) && !loadProfile(name, cfg).movedAt && !force) {
     throw new UsageError(`profile "${name}" already exists; pass --force to overwrite`);
   }
   if (dryRun) {
     console.log(`[dry-run] would import ${from} as profile "${name}"`);
     return;
   }
-  saveProfile(name, { credentials: parsed.credentials ?? null, oauthAccount: parsed.oauthAccount ?? null }, cfg);
+  saveProfile(name, { credentials: adoptLiveChain(name, parsed, cfg), oauthAccount: parsed.oauthAccount ?? null }, cfg);
   console.log(`imported profile "${name}" from ${from} (${parsed.oauthAccount?.emailAddress ?? 'unknown email'})`);
+}
+
+// If the imported account is already logged in on this machine, its local
+// chain is the one that stays valid here; the imported copy still rotates on
+// the source machine, and using it from two machines revokes it everywhere.
+function adoptLiveChain(name, incoming, cfg) {
+  const live = captureLive(cfg);
+  if (live.credentials && definitelySameAccount(live.oauthAccount, incoming.oauthAccount)) {
+    console.error(`"${name}" is the login already active on this machine; keeping the local token chain`);
+    return live.credentials;
+  }
+  return incoming.credentials ?? null;
 }
 
 // --- Encrypt / decrypt the store (migration) ------------------------------------
@@ -644,33 +717,52 @@ export function setStoreEncryption(enabled, cfg = config()) {
 // moving the whole store between machines. Backups and run dirs stay local:
 // backups are point-in-time recovery data, run dirs are regenerated on demand.
 
-export function exportAll(dest, { force = false, dryRun = false } = {}, cfg = config()) {
+export function exportAll(dest, { force = false, move = false, dryRun = false } = {}, cfg = config()) {
   const out = dest ?? 'ccswitch-all.ccswitch.json';
+  const active = getActive(cfg);
+  const live = captureLive(cfg);
   const profiles = {};
+  const entries = [];
   for (const p of listProfiles(cfg)) {
-    profiles[p.name] = { credentials: p.credentials ?? null, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt ?? null };
+    if (p.movedAt) {
+      console.error(`skipping "${p.name}": its chain already moved to another machine`);
+      continue;
+    }
+    // The active profile's freshest chain is the live one: claude refreshes
+    // it in place, and the profile file only catches up on the next switch.
+    const tookLive = p.name === active && !!live.credentials && sameAccount(live.oauthAccount, p.oauthAccount);
+    const credentials = tookLive ? live.credentials : (p.credentials ?? null);
+    profiles[p.name] = { credentials, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt ?? null };
+    entries.push({ name: p.name, credentials, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt, tookLive });
   }
-  if (Object.keys(profiles).length === 0) {
+  if (entries.length === 0) {
     throw new UsageError('no profiles to export — save one with "ccswitch save <name>" first');
   }
   if (dryRun) {
-    console.log(`[dry-run] would write ${Object.keys(profiles).length} profile(s) to ${out}`);
+    console.log(`[dry-run] would write ${entries.length} profile(s) to ${out}${move ? ' and retire them on this machine' : ''}`);
     return out;
   }
   if (fs.existsSync(out) && !force) {
     throw new UsageError(`${out} already exists; pass --force to overwrite`);
   }
   const body = JSON.stringify(
-    { ccswitchExport: 1, exportedAt: new Date().toISOString(), active: getActive(cfg), profiles },
+    { ccswitchExport: 1, exportedAt: new Date().toISOString(), active, profiles },
     null,
     2,
   );
   fs.writeFileSync(out, sealBody(body, cfg), { mode: 0o600 });
   console.log(
     storeEncrypted(cfg)
-      ? `exported ${Object.keys(profiles).length} profile(s) to ${out} (encrypted with your store passphrase)`
-      : `exported ${Object.keys(profiles).length} profile(s) to ${out} (plaintext — it holds live tokens, so guard it)`,
+      ? `exported ${entries.length} profile(s) to ${out} (encrypted with your store passphrase)`
+      : `exported ${entries.length} profile(s) to ${out} (plaintext - it holds live tokens, so guard it)`,
   );
+  if (move) {
+    retireProfiles(entries, cfg);
+  } else {
+    console.error(
+      'note: the exported chains stay active on this machine; pass --move if another machine will take them over (one chain used from two machines logs both out)',
+    );
+  }
   return out;
 }
 
@@ -701,12 +793,13 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
   }
   let imported = 0;
   for (const name of names) {
-    if (profileExists(name, cfg) && !force) {
+    // A moved profile is just a tombstone, so restoring over it needs no --force.
+    if (profileExists(name, cfg) && !loadProfile(name, cfg).movedAt && !force) {
       console.error(`skipping "${name}": profile already exists (pass --force to overwrite)`);
       continue;
     }
     const p = parsed.profiles[name];
-    saveProfile(name, { credentials: p.credentials ?? null, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt ?? undefined }, cfg);
+    saveProfile(name, { credentials: adoptLiveChain(name, p, cfg), oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt ?? undefined }, cfg);
     imported++;
   }
   // Adopt the exported active pointer only on a machine with no active profile,
@@ -721,6 +814,7 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
 
 export function materializeRunDir(name, cfg = config()) {
   const profile = loadProfile(name, cfg);
+  assertNotMoved(name, profile);
   const dir = path.join(cfg.home, 'dirs', name);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(dir, '.credentials.json'), profile.credentials ?? '', { mode: 0o600 });
@@ -904,6 +998,15 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
   let succeeded = 0;
   for (const p of profiles) {
     const isActive = p.name === active;
+    if (p.movedAt) {
+      // The chain rotates on another machine now; refreshing it from here
+      // would revoke it there.
+      rows.push([
+        isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-',
+        `moved to another machine; run "ccswitch login ${p.name}" to use it here`,
+      ]);
+      continue;
+    }
     let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
     let status = 'ok';
     let usage = null;
@@ -950,16 +1053,19 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch list                 show saved profiles
   ccswitch usage                show 5h/7d quota for every profile (refreshes expired tokens)
   ccswitch delete <name>        delete a profile (--force skips confirmation)
-  ccswitch export <name> [file] write a profile to a plaintext file (default <name>.ccswitch.json)
+  ccswitch export <name> [file] write a profile to a plaintext file (--move retires it here)
   ccswitch import <name> [file] load a profile from such a file (--force overwrites)
-  ccswitch export-all [file]    write ALL profiles + active pointer to one file (default ccswitch-all.ccswitch.json)
+  ccswitch export-all [file]    write ALL profiles + active pointer to one file (--move retires them here)
   ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
   ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
   ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
 
-To use an account on a second machine, run "ccswitch login" there — each
-machine gets its own token chain. Export/import moves a login; two machines
-sharing one exported chain will log each other out on refresh.
+Tokens rotate on every refresh, so each chain works from ONE machine only; a
+chain used from two machines gets the account logged out everywhere. For a
+second machine that stays in use, run "ccswitch login <name>" there: accounts
+may be logged in from several machines, each with its own chain. To migrate
+instead, use "export-all --move" / "import-all": --move retires the source
+copies so this machine cannot revoke the moved chains later.
 
 State lives in ~/.claude-profiles. Every mutation writes a backup there first.
 Unencrypted stores keep tokens in plaintext; run "ccswitch encrypt" to protect
@@ -1040,8 +1146,8 @@ export async function main(argv = process.argv.slice(2)) {
       await deleteProfileCmd(requireName(rest[0]), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'export': {
-      const pos = rest.filter((a) => a !== '--force');
-      exportProfile(requireName(pos[0]), pos[1], { force: rest.includes('--force'), dryRun }, cfg);
+      const pos = rest.filter((a) => a !== '--force' && a !== '--move');
+      exportProfile(requireName(pos[0]), pos[1], { force: rest.includes('--force'), move: rest.includes('--move'), dryRun }, cfg);
       return 0;
     }
     case 'import': {
@@ -1050,8 +1156,8 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     case 'export-all': {
-      const pos = rest.filter((a) => a !== '--force');
-      exportAll(pos[0], { force: rest.includes('--force'), dryRun }, cfg);
+      const pos = rest.filter((a) => a !== '--force' && a !== '--move');
+      exportAll(pos[0], { force: rest.includes('--force'), move: rest.includes('--move'), dryRun }, cfg);
       return 0;
     }
     case 'import-all': {

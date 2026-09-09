@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, parseFableLimit } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -924,6 +924,16 @@ test('fetchUsage sends bearer + beta headers and parses windows', async () => {
       json: async () => ({
         five_hour: { utilization: 58, resets_at: '2026-07-18T20:00:00Z' },
         seven_day: { utilization: 84.4, resets_at: '2026-07-24T00:00:00Z' },
+        seven_day_opus: null, // superseded: present but never populated
+        limits: [
+          { kind: 'weekly_all', percent: 84, resets_at: '2026-07-24T00:00:00Z', scope: null },
+          {
+            kind: 'weekly_scoped',
+            percent: 49,
+            resets_at: '2026-07-22T00:00:00Z',
+            scope: { model: { id: null, display_name: 'Fable' }, surface: null },
+          },
+        ],
         extra_field: true,
       }),
     };
@@ -933,15 +943,36 @@ test('fetchUsage sends bearer + beta headers and parses windows', async () => {
   assert.equal(seen.headers['anthropic-beta'], 'oauth-2025-04-20');
   assert.equal(u.fiveHour.utilization, 58);
   assert.equal(u.sevenDay.resetsAt, '2026-07-24T00:00:00Z');
+  assert.equal(u.fable.utilization, 49);
 });
 
 test('fetchUsage maps 401/403 to AuthDeadError; parseUsage tolerates gaps', async () => {
   await assert.rejects(fetchUsage(usageCreds(), async () => ({ ok: false, status: 401 })), AuthDeadError);
   await assert.rejects(fetchUsage(usageCreds(), async () => ({ ok: false, status: 500 })), (e) => !(e instanceof AuthDeadError));
-  assert.deepEqual(parseUsage({}), { fiveHour: null, sevenDay: null });
+  assert.deepEqual(parseUsage({}), { fiveHour: null, sevenDay: null, fable: null });
   assert.deepEqual(parseUsage({ five_hour: { utilization: 'x' } }), {
     fiveHour: { utilization: null, resetsAt: null },
     sevenDay: null,
+    fable: null,
+  });
+});
+
+test('parseFableLimit picks the Fable-scoped limit and nothing else', () => {
+  const fable = { percent: 49, resets_at: '2026-07-22T00:00:00Z', scope: { model: { display_name: 'Fable' } } };
+  assert.deepEqual(parseFableLimit({ limits: [fable] }), { utilization: 49, resetsAt: '2026-07-22T00:00:00Z' });
+  assert.deepEqual(parseFableLimit({ limits: [{ ...fable, scope: { model: { display_name: 'FABLE' } } }] }).utilization, 49);
+  assert.equal(parseFableLimit({}), null);
+  assert.equal(parseFableLimit({ limits: null }), null);
+  // An unscoped or differently-scoped limit must never be read as Fable.
+  assert.equal(parseFableLimit({ limits: [{ kind: 'weekly_all', percent: 84, scope: null }] }), null);
+  assert.equal(
+    parseFableLimit({ limits: [{ kind: 'weekly_scoped', percent: 84, scope: { surface: { display_name: 'Code' } } }] }),
+    null,
+  );
+  // Present but unpopulated: the row renders a dash rather than a bogus 0%.
+  assert.deepEqual(parseFableLimit({ limits: [{ ...fable, percent: null, resets_at: null }] }), {
+    utilization: null,
+    resetsAt: null,
   });
 });
 
@@ -1030,6 +1061,46 @@ test('usageCmd fails soft per profile and only exits 1 when all fail', async (t)
   assert.match(lines.join('\n'), /logged out — run "ccswitch login dead --force"/);
   deleteProfileFile('good', cfg);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
+});
+
+test('usageCmd renders the fable window and keeps every row column-aligned', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  const creds = () =>
+    JSON.stringify({ claudeAiOauth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600000 } });
+  saveProfile('premium', { credentials: creds(), oauthAccount: { emailAddress: 'p@x.com' } }, cfg);
+  saveProfile('plain', { credentials: creds(), oauthAccount: { emailAddress: 'q@x.com' } }, cfg);
+  saveProfile('gone', { credentials: creds(), oauthAccount: { emailAddress: 'r@x.com' }, movedAt: new Date().toISOString() }, cfg);
+  const bodies = {
+    premium: {
+      five_hour: { utilization: 10, resets_at: null },
+      seven_day: { utilization: 20, resets_at: null },
+      limits: [{ kind: 'weekly_scoped', percent: 49, resets_at: null, scope: { model: { display_name: 'Fable' } } }],
+    },
+    plain: {
+      five_hour: { utilization: 10, resets_at: null },
+      seven_day: { utilization: 20, resets_at: null },
+      limits: [{ kind: 'weekly_all', percent: 20, resets_at: null, scope: null }],
+    },
+  };
+  let nth = 0;
+  const lines = captureLog(t);
+  assert.equal(
+    await usageCmd({}, cfg, async () => ({
+      ok: true,
+      status: 200,
+      json: async () => bodies[['plain', 'premium'][nth++]], // 'gone' is moved: never queried
+    })),
+    0,
+  );
+  const out = lines.join('\n').split('\n');
+  assert.match(out[0], /7d\s+resets\s+fable\s+resets\s+status/);
+  assert.match(out.find((l) => /premium/.test(l)), / 49%/);
+  // A moved profile builds its row by hand: check it still has the full column
+  // count, or `status` slides silently under the `fable` header.
+  const statusCol = out[0].indexOf('status');
+  assert.equal(out.find((l) => /premium/.test(l)).indexOf('ok'), statusCol);
+  assert.equal(out.find((l) => /gone/.test(l)).indexOf('moved to'), statusCol);
 });
 
 test('usageCmd --dry-run touches the network never', async (t) => {

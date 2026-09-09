@@ -921,6 +921,23 @@ export async function refreshCredentials(credentials, fetchImpl = fetch) {
   return JSON.stringify(parsed);
 }
 
+// Fable's weekly cap does not arrive as a top-level window like five_hour and
+// seven_day do. It is an entry in `limits`, scoped to the model, and it reports
+// `percent` where the windows report `utilization`. Matching on the model's
+// display name rather than on kind === 'weekly_scoped' keeps this from picking
+// up a scoped limit belonging to some other model or surface.
+const FABLE_MODEL = 'fable';
+
+export function parseFableLimit(body) {
+  const limits = Array.isArray(body?.limits) ? body.limits : [];
+  const limit = limits.find((l) => l?.scope?.model?.display_name?.toLowerCase() === FABLE_MODEL);
+  if (!limit) return null;
+  return {
+    utilization: typeof limit.percent === 'number' ? limit.percent : null,
+    resetsAt: typeof limit.resets_at === 'string' ? limit.resets_at : null,
+  };
+}
+
 export function parseUsage(body) {
   const win = (o) =>
     o && typeof o === 'object'
@@ -929,7 +946,7 @@ export function parseUsage(body) {
           resetsAt: typeof o.resets_at === 'string' ? o.resets_at : null,
         }
       : null;
-  return { fiveHour: win(body?.five_hour), sevenDay: win(body?.seven_day) };
+  return { fiveHour: win(body?.five_hour), sevenDay: win(body?.seven_day), fable: parseFableLimit(body) };
 }
 
 export async function fetchUsage(credentials, fetchImpl = fetch) {
@@ -1007,7 +1024,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       // The chain rotates on another machine now; refreshing it from here
       // would revoke it there.
       rows.push([
-        isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-',
+        isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-', '-', '-',
         `moved to another machine; run "ccswitch login ${p.name}" to use it here`,
       ]);
       continue;
@@ -1038,10 +1055,14 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       usage ? formatResetIn(usage.fiveHour?.resetsAt ?? null) : '-',
       usage ? formatBar(usage.sevenDay?.utilization ?? null, { color }) : '-',
       usage ? formatResetIn(usage.sevenDay?.resetsAt ?? null) : '-',
+      usage ? formatBar(usage.fable?.utilization ?? null, { color }) : '-',
+      usage ? formatResetIn(usage.fable?.resetsAt ?? null) : '-',
       status,
     ]);
   }
-  console.log(renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'status'], rows));
+  console.log(
+    renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'], rows),
+  );
   return succeeded > 0 ? 0 : 1;
 }
 
@@ -1056,7 +1077,7 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch save <name>          save the current login as <name> (--force overwrites)
   ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
   ccswitch list                 show saved profiles
-  ccswitch usage                show 5h/7d quota for every profile (refreshes expired tokens)
+  ccswitch usage                show 5h/7d/fable quota for every profile (refreshes expired tokens)
   ccswitch delete <name>        delete a profile (--force skips confirmation)
   ccswitch export <name> [file] write a profile to a plaintext file (--move retires it here)
   ccswitch import <name> [file] load a profile from such a file (--force overwrites)

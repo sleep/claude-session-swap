@@ -1,9 +1,9 @@
 {
   "name": "ccswitch",
   "version": "1.0.0",
-  "description": "Manage multiple Claude Code subscription accounts (macOS)",
+  "description": "Manage multiple Claude Code and Kimi Code subscription accounts (macOS and Linux)",
   "type": "module",
-  "bin": { "ccswitch": "./ccswitch.mjs" },
+  "bin": { "ccswitch": "./ccswitch.mjs", "kcswitch": "./ccswitch.mjs" },
   "scripts": { "test": "node --test" },
   "engines": { "node": ">=20" },
   "license": "MIT"

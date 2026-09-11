@@ -1,9 +1,12 @@
 #!/usr/bin/env node
-// ccswitch — manage multiple Claude Code subscription accounts.
-// Credentials live in ~/.claude/.credentials.json on every platform. On
+// ccswitch — manage multiple Claude Code and Kimi Code subscription accounts.
+// Claude credentials live in ~/.claude/.credentials.json on every platform. On
 // macOS, Claude Code itself prefers the Keychain, so a lingering Keychain
 // entry is read as the freshest copy and evicted on every write — after
 // which Claude Code falls back to the credentials file.
+// Kimi credentials live at <KIMI_CODE_HOME>/credentials/kimi-code.json
+// (file-only, every platform); a leading "kimi" in the command line selects
+// that backend, as does running under the "kcswitch" bin name.
 // Zero dependencies by design: this tool handles OAuth refresh tokens, so
 // every third-party package would be supply-chain attack surface.
 import { spawnSync } from 'node:child_process';
@@ -17,14 +20,48 @@ import { pathToFileURL } from 'node:url';
 
 export class UsageError extends Error {}
 
-export function config() {
+// Installed under the "kcswitch" bin name, the tool defaults to kimi. Exact
+// match only: anything looser would also catch lookalike paths (test files,
+// editor backups) and silently flip the backend.
+export function defaultTarget() {
+  return path.basename(process.argv[1] ?? '') === 'kcswitch' ? 'kimi' : 'claude';
+}
+
+export function config(target = defaultTarget()) {
+  if (target === 'kimi') {
+    const kimiHome =
+      process.env.KCSWITCH_KIMI_HOME || process.env.KIMI_CODE_HOME || path.join(os.homedir(), '.kimi-code');
+    const bin = process.env.KCSWITCH_KIMI_BIN || 'kimi';
+    return {
+      target: 'kimi',
+      prog: 'ccswitch kimi',
+      toolName: 'Kimi Code',
+      home: process.env.KCSWITCH_HOME || path.join(os.homedir(), '.kimi-profiles'),
+      credentialsFile:
+        process.env.KCSWITCH_CREDENTIALS_FILE || path.join(kimiHome, 'credentials', 'kimi-code.json'),
+      kimiHome,
+      kimiBin: bin,
+      bin,
+      loginArgs: ['login'],
+      runEnvVar: 'KIMI_CODE_HOME',
+      procName: 'kimi',
+    };
+  }
+  const bin = process.env.CCSWITCH_CLAUDE_BIN || 'claude';
   return {
+    target: 'claude',
+    prog: 'ccswitch',
+    toolName: 'Claude Code',
     home: process.env.CCSWITCH_HOME || path.join(os.homedir(), '.claude-profiles'),
     credentialsFile:
       process.env.CCSWITCH_CREDENTIALS_FILE || path.join(os.homedir(), '.claude', '.credentials.json'),
     keychainService: process.env.CCSWITCH_KEYCHAIN_SERVICE || 'Claude Code-credentials',
     claudeJson: process.env.CCSWITCH_CLAUDE_JSON || path.join(os.homedir(), '.claude.json'),
-    claudeBin: process.env.CCSWITCH_CLAUDE_BIN || 'claude',
+    claudeBin: bin,
+    bin,
+    loginArgs: ['/login'],
+    runEnvVar: 'CLAUDE_CONFIG_DIR',
+    procName: 'claude',
   };
 }
 
@@ -50,6 +87,7 @@ export function ensureHome(cfg = config()) {
 // write evicts the entry so claude falls back to the credentials file.
 
 export function readKeychainEntry(cfg = config()) {
+  if (!cfg.keychainService) return null; // kimi: file-only credential store
   if (process.platform !== 'darwin') return null;
   const r = spawnSync('security', ['find-generic-password', '-s', cfg.keychainService, '-w'], {
     encoding: 'utf8',
@@ -60,6 +98,7 @@ export function readKeychainEntry(cfg = config()) {
 }
 
 export function evictKeychainEntry(cfg = config()) {
+  if (!cfg.keychainService) return; // kimi: no Keychain involvement
   if (process.platform !== 'darwin') return;
   const r = spawnSync('security', ['delete-generic-password', '-s', cfg.keychainService], { encoding: 'utf8' });
   if (r.error) return;
@@ -109,8 +148,11 @@ export function deleteCredentials(cfg = config()) {
 // --- ~/.claude.json surgical updates ------------------------------------------
 // ~/.claude.json holds ~95 unrelated keys (projects, history, settings); only
 // the oauthAccount key may ever be touched, and never non-atomically.
+// Kimi has no such identity file — its access-token JWT carries the account —
+// so both functions degrade to no-ops for a kimi cfg.
 
 export function readClaudeJson(cfg = config()) {
+  if (!cfg.claudeJson) return {};
   let raw;
   try {
     raw = fs.readFileSync(cfg.claudeJson, 'utf8');
@@ -126,12 +168,80 @@ export function readClaudeJson(cfg = config()) {
 }
 
 export function updateOauthAccount(oauthAccount, cfg = config()) {
+  if (!cfg.claudeJson) return; // kimi: identity lives in the token, not a file
   const data = readClaudeJson(cfg);
   if (oauthAccount === null) delete data.oauthAccount;
   else data.oauthAccount = oauthAccount;
   const tmp = `${cfg.claudeJson}.ccswitch-${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, cfg.claudeJson);
+}
+
+// --- Kimi Code backend ----------------------------------------------------------
+// Kimi Code keeps a single login at <KIMI_CODE_HOME>/credentials/kimi-code.json
+// ({access_token, refresh_token, expires_at, scope, token_type, expires_in},
+// expires_at in unix seconds). The access token is a JWT whose `sub` is the
+// account's user id — the only on-disk identity, since kimi has no
+// ~/.claude.json-style account record. Display fields (nickname, email, level)
+// come from best-effort GETs to <baseUrl>/me and are cached in the profile.
+
+const KIMI_CLIENT_ID = '17e5f671-d194-4dfb-9706-5516cb48c098'; // kimi-code's public client id
+const KIMI_DEFAULT_OAUTH_HOST = 'https://auth.kimi.com';
+const KIMI_DEFAULT_BASE_URL = 'https://api.kimi.com/coding/v1';
+
+export function decodeJwtPayload(token) {
+  try {
+    const part = String(token).split('.')[1];
+    if (!part) return null;
+    return JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function kimiIdentityFromCredentials(credentials) {
+  try {
+    const userId = decodeJwtPayload(JSON.parse(credentials)?.access_token)?.sub;
+    return typeof userId === 'string' && userId ? { userId } : null;
+  } catch {
+    return null;
+  }
+}
+
+// Region/endpoint hints, mirroring kimi's own resolution order: env override,
+// then the persisted login in config.toml's managed-provider section, then the
+// mainland-cn default. Parsed with regexes to stay zero-dependency; anything
+// unreadable just falls through to the defaults.
+export function readKimiConnection(cfg = config('kimi')) {
+  let text = '';
+  try {
+    text = fs.readFileSync(path.join(cfg.kimiHome, 'config.toml'), 'utf8');
+  } catch {}
+  const sectionBody = (header) => {
+    const m = new RegExp(`^\\[${header.replace(/[."[\]]/g, (c) => `\\${c}`)}\\][ \\t]*$`, 'm').exec(text);
+    if (!m) return '';
+    const rest = text.slice(m.index + m[0].length);
+    const next = rest.search(/^\[/m);
+    return next === -1 ? rest : rest.slice(0, next);
+  };
+  const str = (body, key) =>
+    new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, 'm').exec(body)?.[1] ?? null;
+  const provider = sectionBody('providers."managed:kimi-code"');
+  const oauth = sectionBody('providers."managed:kimi-code".oauth');
+  return {
+    baseUrl: process.env.KIMI_CODE_BASE_URL ?? str(provider, 'base_url') ?? KIMI_DEFAULT_BASE_URL,
+    oauthHost:
+      process.env.KIMI_CODE_OAUTH_HOST ?? process.env.KIMI_OAUTH_HOST ?? str(oauth, 'oauthHost') ?? KIMI_DEFAULT_OAUTH_HOST,
+  };
+}
+
+// Account/level cells for list and usage, across both identity shapes.
+function displayAccount(oauthAccount) {
+  return oauthAccount?.emailAddress ?? oauthAccount?.nickname ?? oauthAccount?.email ?? oauthAccount?.userId ?? null;
+}
+
+function displayTier(oauthAccount) {
+  return oauthAccount?.organizationRateLimitTier ?? oauthAccount?.userLevelName ?? null;
 }
 
 // --- Encryption at rest (opt-in) -------------------------------------------------
@@ -195,8 +305,8 @@ export function setPassphrase(p) {
 }
 
 function mustPassphrase() {
-  const p = passphraseCache ?? process.env.CCSWITCH_PASSPHRASE;
-  if (!p) throw new UsageError('this store is encrypted; set CCSWITCH_PASSPHRASE or run interactively');
+  const p = passphraseCache ?? process.env.CCSWITCH_PASSPHRASE ?? process.env.KCSWITCH_PASSPHRASE;
+  if (!p) throw new UsageError('this store is encrypted; set CCSWITCH_PASSPHRASE/KCSWITCH_PASSPHRASE or run interactively');
   return p;
 }
 
@@ -214,13 +324,13 @@ async function promptHidden(question) {
 }
 
 export async function requirePassphrase({ confirm = false } = {}) {
-  const preset = passphraseCache ?? process.env.CCSWITCH_PASSPHRASE;
+  const preset = passphraseCache ?? process.env.CCSWITCH_PASSPHRASE ?? process.env.KCSWITCH_PASSPHRASE;
   if (preset) {
     passphraseCache = preset;
     return preset;
   }
   if (!process.stdin.isTTY) {
-    throw new UsageError('this store is encrypted; set CCSWITCH_PASSPHRASE or run interactively');
+    throw new UsageError('this store is encrypted; set CCSWITCH_PASSPHRASE/KCSWITCH_PASSPHRASE or run interactively');
   }
   const p = await promptHidden('Passphrase: ');
   if (!p) throw new UsageError('empty passphrase');
@@ -246,9 +356,28 @@ function profilePath(name, cfg) {
   return path.join(cfg.home, 'profiles', `${name}.json`);
 }
 
+function quietLoadProfile(name, cfg) {
+  try {
+    return JSON.parse(openBody(fs.readFileSync(profilePath(name, cfg), 'utf8')));
+  } catch {
+    return null;
+  }
+}
+
 export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt }, cfg = config()) {
   validateName(name);
   ensureHome(cfg);
+  // Kimi display fields (nickname, email, level) arrive via best-effort /me
+  // lookups; a bare token save-back for the same account must not drop them.
+  if (oauthAccount?.userId) {
+    const prev = quietLoadProfile(name, cfg);
+    if (prev?.oauthAccount?.userId === oauthAccount.userId) {
+      oauthAccount = {
+        ...prev.oauthAccount,
+        ...Object.fromEntries(Object.entries(oauthAccount).filter(([, v]) => v != null)),
+      };
+    }
+  }
   const body = JSON.stringify(
     { credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString(), ...(movedAt ? { movedAt } : {}) },
     null,
@@ -337,53 +466,68 @@ export function writeBackup(reason, payload, cfg = config()) {
 // --- Core operations -------------------------------------------------------------
 
 export function captureLive(cfg = config()) {
+  const credentials = readCredentials(cfg);
+  if (cfg.target === 'kimi') {
+    return { credentials, oauthAccount: kimiIdentityFromCredentials(credentials) };
+  }
   return {
-    credentials: readCredentials(cfg),
+    credentials,
     oauthAccount: readClaudeJson(cfg).oauthAccount ?? null,
   };
+}
+
+// Identity keys by backend shape: claude's oauthAccount carries
+// accountUuid/emailAddress, kimi's carries userId (from the token JWT) plus
+// email from /me lookups. No backend's shape has another's keys.
+function identityKey(a) {
+  return a?.accountUuid ?? a?.userId ?? a?.emailAddress ?? a?.email ?? null;
 }
 
 // Missing identity on either side proves nothing; only a definite
 // mismatch blocks the save-back.
 function sameAccount(a, b) {
-  const ka = a?.accountUuid ?? a?.emailAddress;
-  const kb = b?.accountUuid ?? b?.emailAddress;
+  const ka = identityKey(a);
+  const kb = identityKey(b);
   return !ka || !kb || ka === kb;
 }
 
 // Import needs the opposite bias: only a definite identity match may let the
 // machine's own live chain override incoming credentials.
 function definitelySameAccount(a, b) {
-  const ka = a?.accountUuid ?? a?.emailAddress;
-  const kb = b?.accountUuid ?? b?.emailAddress;
+  const ka = identityKey(a);
+  const kb = identityKey(b);
   return !!ka && !!kb && ka === kb;
 }
 
 // Token chains rotate on refresh, so a chain moved to another machine must
 // never be used from here again: replaying it revokes the account everywhere.
-function assertNotMoved(name, profile) {
+function assertNotMoved(name, profile, cfg = config()) {
   if (profile.movedAt) {
     throw new UsageError(
       `profile "${name}" was moved to another machine on ${profile.movedAt}; ` +
-        `run "ccswitch login ${name}" for a fresh chain here, or import it back`,
+        `run "${cfg.prog} login ${name}" for a fresh chain here, or import it back`,
+    );
+  }
+}
+
+export function warnIfToolRunning(cfg = config()) {
+  const r = spawnSync('pgrep', ['-x', cfg.procName], { encoding: 'utf8' });
+  if (r.status === 0) {
+    console.error(
+      `warning: ${cfg.procName} is currently running; open sessions keep the old account and may rewrite the credentials when their token refreshes`,
     );
   }
 }
 
 export function warnIfClaudeRunning() {
-  const r = spawnSync('pgrep', ['-x', 'claude'], { encoding: 'utf8' });
-  if (r.status === 0) {
-    console.error(
-      'warning: claude is currently running; open sessions keep the old account and may rewrite the credentials when their token refreshes',
-    );
-  }
+  warnIfToolRunning(config());
 }
 
 export function switchTo(name, { dryRun = false } = {}, cfg = config()) {
   const profile = loadProfile(name, cfg);
-  assertNotMoved(name, profile);
+  assertNotMoved(name, profile, cfg);
   const active = getActive(cfg);
-  const email = profile.oauthAccount?.emailAddress ?? 'unknown email';
+  const email = displayAccount(profile.oauthAccount) ?? 'unknown email';
   if (dryRun) {
     console.log(
       `[dry-run] would back up live credentials, ` +
@@ -415,16 +559,25 @@ export function switchTo(name, { dryRun = false } = {}, cfg = config()) {
   writeCredentials(profile.credentials, cfg);
   updateOauthAccount(profile.oauthAccount, cfg);
   setActive(name, cfg);
-  warnIfClaudeRunning();
+  warnIfToolRunning(cfg);
   console.log(`switched to "${name}" (${email})`);
 }
 
 // --- list / delete ----------------------------------------------------------------
 
+// Claude stores expiresAt in milliseconds under claudeAiOauth; kimi stores
+// expires_at in unix seconds at the top level.
+function expiryMs(parsed) {
+  const claude = parsed?.claudeAiOauth?.expiresAt;
+  if (claude) return claude;
+  const kimi = parsed?.expires_at;
+  return typeof kimi === 'number' ? kimi * 1000 : null;
+}
+
 export function tokenExpiry(credentials) {
   try {
-    const expiresAt = JSON.parse(credentials)?.claudeAiOauth?.expiresAt;
-    return expiresAt ? new Date(expiresAt).toISOString() : '-';
+    const ms = expiryMs(JSON.parse(credentials));
+    return ms ? new Date(ms).toISOString() : '-';
   } catch {
     return '-';
   }
@@ -432,14 +585,17 @@ export function tokenExpiry(credentials) {
 
 export function formatList(cfg = config()) {
   const profiles = listProfiles(cfg);
-  if (profiles.length === 0) return 'no profiles yet — save your current login with "ccswitch save <name>"';
+  if (profiles.length === 0) return `no profiles yet — save your current login with "${cfg.prog} save <name>"`;
   const active = getActive(cfg);
-  const header = [' ', 'name', 'email', 'tier', 'token expires', 'saved'];
+  const header =
+    cfg.target === 'kimi'
+      ? [' ', 'name', 'account', 'level', 'token expires', 'saved']
+      : [' ', 'name', 'email', 'tier', 'token expires', 'saved'];
   const rows = profiles.map((p) => [
     p.name === active ? '*' : ' ',
     p.name,
-    p.oauthAccount?.emailAddress ?? '-',
-    p.oauthAccount?.organizationRateLimitTier ?? '-',
+    displayAccount(p.oauthAccount) ?? '-',
+    displayTier(p.oauthAccount) ?? '-',
     p.movedAt ? 'moved' : tokenExpiry(p.credentials),
     p.savedAt ?? '-',
   ]);
@@ -493,7 +649,12 @@ export function saveCurrent(name, { force = false, dryRun = false } = {}, cfg = 
   }
   const live = captureLive(cfg);
   if (!live.credentials) {
-    throw new UsageError('no live Claude Code login found — use "ccswitch login <name>" instead');
+    throw new UsageError(`no live ${cfg.toolName} login found — use "${cfg.prog} login <name>" instead`);
+  }
+  if (cfg.target === 'kimi') {
+    // Record the region endpoints this login resolves to, so later refreshes
+    // and usage lookups hit the right deployment.
+    live.oauthAccount = { ...readKimiConnection(cfg), ...(live.oauthAccount ?? {}) };
   }
   saveProfile(name, live, cfg);
   const active = getActive(cfg);
@@ -504,23 +665,23 @@ export function saveCurrent(name, { force = false, dryRun = false } = {}, cfg = 
   } else {
     setActive(name, cfg);
   }
-  console.log(`saved current login as "${name}" (${live.oauthAccount?.emailAddress ?? 'unknown email'})`);
+  console.log(`saved current login as "${name}" (${displayAccount(live.oauthAccount) ?? 'unknown email'})`);
 }
 
 // --- Guided login -----------------------------------------------------------------
 
-export async function login(name, { force = false, dryRun = false } = {}, cfg = config()) {
+export async function login(name, { force = false, dryRun = false, region = null, fetchImpl = fetch } = {}, cfg = config()) {
   validateName(name);
   // A moved profile is just a tombstone, so logging back into it needs no --force.
   const existing = profileExists(name, cfg) ? loadProfile(name, cfg) : null;
   if (existing && !existing.movedAt && !force) {
     throw new UsageError(
-      `profile "${name}" already exists; use "ccswitch ${name}" to switch to it, or pass --force to re-login and replace it`,
+      `profile "${name}" already exists; use "${cfg.prog} ${name}" to switch to it, or pass --force to re-login and replace it`,
     );
   }
   if (dryRun) {
     console.log(
-      `[dry-run] would stash current credentials, launch ${cfg.claudeBin} for login, and save the new account as "${name}"`,
+      `[dry-run] would stash current credentials, launch ${cfg.bin} for login, and save the new account as "${name}"`,
     );
     return;
   }
@@ -561,20 +722,28 @@ export async function login(name, { force = false, dryRun = false } = {}, cfg = 
       setActive(active, cfg);
     }
   };
-  console.log('Launching Claude Code — complete the login it offers, then exit (/exit) to continue.');
-  const r = spawnSync(cfg.claudeBin, ['/login'], { stdio: 'inherit' });
+  console.log(
+    cfg.target === 'kimi'
+      ? 'Launching Kimi Code — complete the device-code login it offers, then exit to continue.'
+      : 'Launching Claude Code — complete the login it offers, then exit (/exit) to continue.',
+  );
+  const r = spawnSync(cfg.bin, [...cfg.loginArgs, ...(region ? ['--region', region] : [])], { stdio: 'inherit' });
   if (r.error) {
     restore();
-    throw new Error(`could not launch ${cfg.claudeBin}: ${r.error.message}; previous state restored`);
+    throw new Error(`could not launch ${cfg.bin}: ${r.error.message}; previous state restored`);
   }
   const fresh = captureLive(cfg);
   if (!fresh.credentials) {
     restore();
     throw new Error('no new credentials found after login; previous state restored');
   }
+  if (cfg.target === 'kimi') {
+    // Best-effort: region endpoints from config.toml, nickname/email from /me.
+    fresh.oauthAccount = await enrichKimiIdentity(fresh.credentials, fresh.oauthAccount, cfg, fetchImpl);
+  }
   saveProfile(name, fresh, cfg);
   setActive(name, cfg);
-  console.log(`logged in and saved profile "${name}" (${fresh.oauthAccount?.emailAddress ?? 'unknown email'})`);
+  console.log(`logged in and saved profile "${name}" (${displayAccount(fresh.oauthAccount) ?? 'unknown email'})`);
 }
 
 // --- Import / export (plaintext transfer between machines) ---------------------
@@ -588,7 +757,7 @@ function transferPath(name, given) {
 
 export function exportProfile(name, dest, { force = false, move = false, dryRun = false } = {}, cfg = config()) {
   const profile = loadProfile(name, cfg); // throws UsageError if the profile is missing
-  assertNotMoved(name, profile); // its chain already lives elsewhere; exporting it would ship a dead chain
+  assertNotMoved(name, profile, cfg); // its chain already lives elsewhere; exporting it would ship a dead chain
   const out = transferPath(name, dest);
   if (dryRun) {
     console.log(`[dry-run] would write profile "${name}" to ${out}${move ? ' and retire it on this machine' : ''}`);
@@ -819,9 +988,30 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
 
 export function materializeRunDir(name, cfg = config()) {
   const profile = loadProfile(name, cfg);
-  assertNotMoved(name, profile);
+  assertNotMoved(name, profile, cfg);
   const dir = path.join(cfg.home, 'dirs', name);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (cfg.target === 'kimi') {
+    // The run dir is a whole KIMI_CODE_HOME: credentials plus a minimal
+    // config.toml that pins the region endpoints. The user's own config.toml
+    // is never copied — it can hold API keys for other providers.
+    const credDir = path.join(dir, 'credentials');
+    fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(credDir, 'kimi-code.json'), profile.credentials ?? '', { mode: 0o600 });
+    const confPath = path.join(dir, 'config.toml');
+    if (!fs.existsSync(confPath)) {
+      const conn = readKimiConnection(cfg);
+      const baseUrl = profile.oauthAccount?.baseUrl ?? conn.baseUrl;
+      const oauthHost = profile.oauthAccount?.oauthHost ?? conn.oauthHost;
+      fs.writeFileSync(
+        confPath,
+        `[providers."managed:kimi-code"]\ntype = "kimi"\nbase_url = "${baseUrl}"\n\n` +
+          `[providers."managed:kimi-code".oauth]\nstorage = "file"\noauthHost = "${oauthHost}"\n`,
+        { mode: 0o600 },
+      );
+    }
+    return dir;
+  }
   fs.writeFileSync(path.join(dir, '.credentials.json'), profile.credentials ?? '', { mode: 0o600 });
   const cjPath = path.join(dir, '.claude.json');
   let cj = {};
@@ -842,17 +1032,23 @@ export function materializeRunDir(name, cfg = config()) {
 // profile's snapshot is dead. Persist whatever the session left in the run
 // dir back into the profile, or the next run starts from a revoked token.
 export function saveBackRunDir(name, dir, cfg = config()) {
+  const credFile =
+    cfg.target === 'kimi' ? path.join(dir, 'credentials', 'kimi-code.json') : path.join(dir, '.credentials.json');
   let credentials;
   try {
-    credentials = fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8');
+    credentials = fs.readFileSync(credFile, 'utf8');
   } catch {
     return;
   }
   if (!credentials) return;
   let oauthAccount = null;
-  try {
-    oauthAccount = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')).oauthAccount ?? null;
-  } catch {}
+  if (cfg.target === 'kimi') {
+    oauthAccount = kimiIdentityFromCredentials(credentials);
+  } else {
+    try {
+      oauthAccount = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')).oauthAccount ?? null;
+    } catch {}
+  }
   const profile = loadProfile(name, cfg);
   if (!sameAccount(oauthAccount, profile.oauthAccount)) {
     console.error(
@@ -863,11 +1059,11 @@ export function saveBackRunDir(name, dir, cfg = config()) {
   saveProfile(name, { credentials, oauthAccount: oauthAccount ?? profile.oauthAccount }, cfg);
 }
 
-export function runProfile(name, claudeArgs, cfg = config()) {
+export function runProfile(name, toolArgs, cfg = config()) {
   const dir = materializeRunDir(name, cfg);
-  const r = spawnSync(cfg.claudeBin, claudeArgs, {
+  const r = spawnSync(cfg.bin, toolArgs, {
     stdio: 'inherit',
-    env: { ...process.env, CLAUDE_CONFIG_DIR: dir },
+    env: { ...process.env, [cfg.runEnvVar]: dir },
   });
   if (r.error) throw r.error;
   saveBackRunDir(name, dir, cfg);
@@ -890,9 +1086,9 @@ export class AuthDeadError extends Error {}
 
 export function tokenExpired(credentials, now = Date.now()) {
   try {
-    const expiresAt = JSON.parse(credentials)?.claudeAiOauth?.expiresAt;
-    if (!expiresAt) return true;
-    return new Date(expiresAt).getTime() - EXPIRY_MARGIN_MS <= now;
+    const ms = expiryMs(JSON.parse(credentials));
+    if (!ms) return true;
+    return ms - EXPIRY_MARGIN_MS <= now;
   } catch {
     return true;
   }
@@ -960,6 +1156,182 @@ export async function fetchUsage(credentials, fetchImpl = fetch) {
   return parseUsage(await res.json());
 }
 
+// --- Kimi usage / refresh / profile lookups ------------------------------------
+// Mirrors of the claude functions above against kimi's endpoints: refresh via
+// <oauthHost>/api/oauth/token (form-encoded, like kimi itself), quota via
+// GET <baseUrl>/usages, account display fields via GET <baseUrl>/me.
+
+export async function refreshKimiCredentials(credentials, fetchImpl = fetch, { oauthHost } = {}) {
+  const parsed = JSON.parse(credentials);
+  if (!parsed?.refresh_token) throw new AuthDeadError('no refresh token stored');
+  const host = (oauthHost ?? process.env.KIMI_CODE_OAUTH_HOST ?? process.env.KIMI_OAUTH_HOST ?? KIMI_DEFAULT_OAUTH_HOST).replace(
+    /\/+$/,
+    '',
+  );
+  const res = await fetchImpl(`${host}/api/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+    body: new URLSearchParams({
+      client_id: KIMI_CLIENT_ID,
+      grant_type: 'refresh_token',
+      refresh_token: parsed.refresh_token,
+    }).toString(),
+  });
+  const body = await res.json().catch(() => ({}));
+  // kimi itself treats 401/403 and invalid_grant as terminal for the chain.
+  if (res.status === 401 || res.status === 403 || body?.error === 'invalid_grant') {
+    throw new AuthDeadError(`refresh rejected (HTTP ${res.status})`);
+  }
+  if (!res.ok) throw new Error(`token refresh failed (HTTP ${res.status})`);
+  if (typeof body?.access_token !== 'string') throw new Error('token refresh returned no access_token');
+  const expiresIn = Number(body.expires_in);
+  return JSON.stringify({
+    ...parsed,
+    access_token: body.access_token,
+    refresh_token: typeof body.refresh_token === 'string' ? body.refresh_token : parsed.refresh_token,
+    expires_at: Math.floor(Date.now() / 1000) + (Number.isFinite(expiresIn) ? expiresIn : 0),
+    ...(typeof body.scope === 'string' ? { scope: body.scope } : {}),
+    ...(typeof body.token_type === 'string' ? { token_type: body.token_type } : {}),
+    ...(Number.isFinite(expiresIn) ? { expires_in: expiresIn } : {}),
+  });
+}
+
+const toIntOrNull = (v) => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+};
+
+const KIMI_TIME_UNITS = { TIME_UNIT_MINUTE: 'minute', TIME_UNIT_HOUR: 'hour', TIME_UNIT_DAY: 'day', TIME_UNIT_WEEK: 'week' };
+
+function kimiWindowFrom(raw) {
+  const duration = toIntOrNull(raw?.duration);
+  const unit = KIMI_TIME_UNITS[raw?.timeUnit] ?? null;
+  return duration !== null && unit ? { duration, unit } : null;
+}
+
+export function kimiWindowLabel(window) {
+  if (!window) return null;
+  let { duration, unit } = window;
+  if (unit === 'minute' && duration >= 60 && duration % 60 === 0) {
+    duration /= 60;
+    unit = 'hour';
+  }
+  const suffix = { minute: 'm', hour: 'h', day: 'd', week: 'w' }[unit];
+  return suffix ? `${duration}${suffix}` : null;
+}
+
+function kimiUsageRow(raw, { name = null, window = null } = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  const used = toIntOrNull(raw.used);
+  const limit = toIntOrNull(raw.limit);
+  if (used === null && limit === null) return null;
+  const w = window ?? kimiWindowFrom(raw.window);
+  return {
+    name: name ?? (typeof raw.name === 'string' && raw.name ? raw.name : null),
+    label: kimiWindowLabel(w),
+    used: used ?? 0,
+    limit: limit ?? 0,
+    utilization: limit ? ((used ?? 0) / limit) * 100 : null,
+    resetsAt: typeof raw.resetTime === 'string' && raw.resetTime ? raw.resetTime : null,
+  };
+}
+
+// The booster wallet reports fixed-point amounts: 1e6 units = 1 cent.
+const KIMI_FIXED_POINT_CENTS = 1e6;
+
+function parseKimiBooster(raw) {
+  const balance = raw?.balance;
+  if (balance?.type !== 'BOOSTER') return null;
+  const total = toIntOrNull(balance.amount);
+  if (total === null || total <= 0) return null;
+  const left = toIntOrNull(balance.amountLeft) ?? 0;
+  const currency = raw?.monthlyChargeLimit?.currency || raw?.monthlyUsed?.currency || 'USD';
+  return {
+    balanceCents: Math.round(left / KIMI_FIXED_POINT_CENTS),
+    totalCents: Math.round(total / KIMI_FIXED_POINT_CENTS),
+    currency,
+  };
+}
+
+export function parseKimiUsage(body) {
+  const rec = body && typeof body === 'object' ? body : {};
+  let summary = kimiUsageRow(rec.usage);
+  // kimi treats a windowless summary as the weekly quota.
+  if (summary && !summary.label) summary = { ...summary, label: '1w' };
+  const limits = [];
+  if (Array.isArray(rec.limits)) {
+    for (const item of rec.limits) {
+      const row = kimiUsageRow(item?.detail, {
+        name: typeof item?.name === 'string' && item.name ? item.name : null,
+        window: kimiWindowFrom(item?.window),
+      });
+      if (row) limits.push(row);
+    }
+  }
+  return { summary, limits, booster: parseKimiBooster(rec.boosterWallet) };
+}
+
+export async function fetchKimiUsage(credentials, fetchImpl = fetch, { baseUrl } = {}) {
+  const token = JSON.parse(credentials)?.access_token;
+  if (!token) throw new AuthDeadError('no access token stored');
+  const base = (baseUrl ?? process.env.KIMI_CODE_BASE_URL ?? KIMI_DEFAULT_BASE_URL).replace(/\/+$/, '');
+  const res = await fetchImpl(`${base}/usages`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  });
+  if (res.status === 401 || res.status === 403) throw new AuthDeadError(`token rejected (HTTP ${res.status})`);
+  if (!res.ok) throw new Error(`usage request failed (HTTP ${res.status})`);
+  return parseKimiUsage(await res.json());
+}
+
+// /me answers in snake_case; anything unusable degrades to null (callers
+// treat the lookup as strictly best-effort).
+export async function fetchKimiUserInfo(baseUrl, accessToken, fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(`${String(baseUrl).replace(/\/+$/, '')}/me`, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json();
+    const str = (v) => (typeof v === 'string' && v ? v : null);
+    if (!str(body?.user_id)) return null;
+    return {
+      userId: body.user_id,
+      nickname: str(body.nickname),
+      email: str(body.email),
+      userLevelName: str(body.user_level_name),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Fill in everything a kimi profile likes to carry: region endpoints from
+// config.toml/env, display fields from /me. Never throws — the login must not
+// fail just because the profile lookup did.
+export async function enrichKimiIdentity(credentials, identity, cfg = config('kimi'), fetchImpl = fetch) {
+  const conn = readKimiConnection(cfg);
+  const out = { ...conn, ...(identity ?? {}) };
+  let accessToken = null;
+  try {
+    accessToken = JSON.parse(credentials)?.access_token ?? null;
+  } catch {}
+  if (!accessToken) return out;
+  const me = await fetchKimiUserInfo(conn.baseUrl, accessToken, fetchImpl);
+  if (me) {
+    out.userId = out.userId ?? me.userId;
+    if (me.nickname) out.nickname = me.nickname;
+    if (me.email) out.email = me.email;
+    if (me.userLevelName) out.userLevelName = me.userLevelName;
+  }
+  return out;
+}
+
+export function formatCents(cents, currency) {
+  const amount = (cents / 100).toFixed(2);
+  return currency === 'USD' ? `$${amount}` : `${currency} ${amount}`;
+}
+
 const BAR_WIDTH = 5;
 const EIGHTHS = '▏▎▍▌▋▊▉█';
 
@@ -1000,9 +1372,10 @@ export function renderTable(header, rows) {
 }
 
 export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
+  if (cfg.target === 'kimi') return kimiUsageCmd({ dryRun }, cfg, fetchImpl);
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
-    console.log('no profiles yet — save your current login with "ccswitch save <name>"');
+    console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
     return 0;
   }
   const active = getActive(cfg);
@@ -1025,7 +1398,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       // would revoke it there.
       rows.push([
         isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-', '-', '-',
-        `moved to another machine; run "ccswitch login ${p.name}" to use it here`,
+        `moved to another machine; run "${cfg.prog} login ${p.name}" to use it here`,
       ]);
       continue;
     }
@@ -1045,7 +1418,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       usage = await fetchUsage(credentials, fetchImpl);
       succeeded++;
     } catch (err) {
-      status = err instanceof AuthDeadError ? `logged out — run "ccswitch login ${p.name} --force"` : `error: ${err.message}`;
+      status = err instanceof AuthDeadError ? `logged out — run "${cfg.prog} login ${p.name} --force"` : `error: ${err.message}`;
     }
     rows.push([
       isActive ? '*' : ' ',
@@ -1063,6 +1436,94 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
   console.log(
     renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'], rows),
   );
+  return succeeded > 0 ? 0 : 1;
+}
+
+// Kimi's /usages shape differs from claude's: a weekly summary row, extra
+// scoped limit windows, and a booster wallet balance. Columns follow suit.
+export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi'), fetchImpl = fetch) {
+  const profiles = listProfiles(cfg);
+  if (profiles.length === 0) {
+    console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
+    return 0;
+  }
+  const active = getActive(cfg);
+  if (dryRun) {
+    for (const p of profiles) {
+      const credentials = p.name === active ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+      console.log(
+        `[dry-run] would query usage for "${p.name}"${tokenExpired(credentials) ? ' (needs token refresh first)' : ''}`,
+      );
+    }
+    return 0;
+  }
+  const color = process.stdout.isTTY === true;
+  const rows = [];
+  let succeeded = 0;
+  for (const p of profiles) {
+    const isActive = p.name === active;
+    let account = displayAccount(p.oauthAccount) ?? '-';
+    if (p.movedAt) {
+      // The chain rotates on another machine now; refreshing it from here
+      // would revoke it there.
+      rows.push([
+        isActive ? '*' : ' ', p.name, account, '-', '-', '-', '-',
+        `moved to another machine; run "${cfg.prog} login ${p.name}" to use it here`,
+      ]);
+      continue;
+    }
+    let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+    let oauthAccount = p.oauthAccount;
+    let status = 'ok';
+    let usage = null;
+    try {
+      if (!credentials) throw new AuthDeadError('no credentials stored');
+      if (tokenExpired(credentials)) {
+        credentials = await refreshKimiCredentials(credentials, fetchImpl, { oauthHost: oauthAccount?.oauthHost });
+        // Persist-before-use: the rotated chain reaches disk before anything
+        // can go wrong with the usage call (or the process).
+        saveProfile(p.name, { credentials, oauthAccount }, cfg);
+        if (isActive) writeCredentials(credentials, cfg);
+        status = 'ok (refreshed)';
+      }
+      const baseUrl = oauthAccount?.baseUrl ?? readKimiConnection(cfg).baseUrl;
+      usage = await fetchKimiUsage(credentials, fetchImpl, { baseUrl });
+      succeeded++;
+      // Best-effort: cache the account's display fields into the profile so
+      // list/usage show a nickname instead of a bare user id.
+      const me = await fetchKimiUserInfo(baseUrl, JSON.parse(credentials).accessToken, fetchImpl);
+      if (me) {
+        const add = {};
+        if (!oauthAccount?.nickname && me.nickname) add.nickname = me.nickname;
+        if (!oauthAccount?.email && me.email) add.email = me.email;
+        if (!oauthAccount?.userLevelName && me.userLevelName) add.userLevelName = me.userLevelName;
+        if (Object.keys(add).length > 0 || !oauthAccount?.userId) {
+          oauthAccount = { ...oauthAccount, userId: oauthAccount?.userId ?? me.userId, ...add };
+          saveProfile(p.name, { credentials, oauthAccount }, cfg);
+          account = displayAccount(oauthAccount) ?? account;
+        }
+      }
+    } catch (err) {
+      status = err instanceof AuthDeadError ? `logged out — run "${cfg.prog} login ${p.name} --force"` : `error: ${err.message}`;
+    }
+    rows.push([
+      isActive ? '*' : ' ',
+      p.name,
+      account,
+      usage?.summary ? formatBar(usage.summary.utilization, { color }) : '-',
+      usage?.summary ? formatResetIn(usage.summary.resetsAt) : '-',
+      usage
+        ? usage.limits.length
+          ? usage.limits
+              .map((l) => `${l.label ?? l.name} ${formatBar(l.utilization, { color })} ${formatResetIn(l.resetsAt)}`)
+              .join('  ')
+          : '-'
+        : '-',
+      usage?.booster ? formatCents(usage.booster.balanceCents, usage.booster.currency) : '-',
+      status,
+    ]);
+  }
+  console.log(renderTable([' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', 'status'], rows));
   return succeeded > 0 ? 0 : 1;
 }
 
@@ -1086,6 +1547,17 @@ const HELP = `usage: ccswitch [--dry-run] <command>
   ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
   ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
 
+Kimi Code accounts: prefix any command with "kimi" — "ccswitch kimi save work",
+"ccswitch kimi work", "ccswitch kimi run work -- -p ...", "ccswitch kimi usage",
+and so on through the whole command set. "ccswitch kimi login <name>" runs
+"kimi login" (pass --region global for kimi.ai accounts; mainland-cn is the
+default). Kimi state lives in ~/.kimi-profiles, the live login is
+~/.kimi-code/credentials/kimi-code.json, and "run" isolates via KIMI_CODE_HOME.
+Installed under the "kcswitch" bin name, the tool targets kimi without the
+prefix. (A claude profile literally named "kimi" stays reachable via
+"ccswitch switch kimi".) KCSWITCH_* env vars mirror the CCSWITCH_* ones;
+CCSWITCH_PASSPHRASE and KCSWITCH_PASSPHRASE both work for either store.
+
 Tokens rotate on every refresh, so each chain works from ONE machine only; a
 chain used from two machines gets the account logged out everywhere. For a
 second machine that stays in use, run "ccswitch login <name>" there: accounts
@@ -1105,11 +1577,11 @@ function requireName(name) {
 async function pickProfile(cfg) {
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
-    throw new UsageError('no profiles yet — save your current login with "ccswitch save <name>"');
+    throw new UsageError(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
   }
   const active = getActive(cfg);
   for (const [i, p] of profiles.entries()) {
-    console.log(`${i + 1}) ${p.name === active ? '*' : ' '} ${p.name} (${p.oauthAccount?.emailAddress ?? '-'})`);
+    console.log(`${i + 1}) ${p.name === active ? '*' : ' '} ${p.name} (${displayAccount(p.oauthAccount) ?? '-'})`);
   }
   const answer = await promptLine('Switch to: ');
   const idx = Number(answer) - 1;
@@ -1125,8 +1597,12 @@ export async function main(argv = process.argv.slice(2)) {
   const tail = sep === -1 ? [] : argv.slice(sep + 1);
   const dryRun = head.includes('--dry-run');
   const args = head.filter((a) => a !== '--dry-run');
+  // A leading "kimi" selects the Kimi Code backend; without it the target is
+  // claude, unless the tool is running under its "kcswitch" bin name.
+  const target = args[0] === 'kimi' ? 'kimi' : defaultTarget();
+  if (args[0] === 'kimi') args.shift();
   const [cmd, ...rest] = args;
-  const cfg = config();
+  const cfg = config(target);
 
   if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
     console.log(HELP);
@@ -1154,9 +1630,16 @@ export async function main(argv = process.argv.slice(2)) {
     return 0;
   }
   switch (cmd) {
-    case 'login':
-      await login(requireName(rest.find((a) => a !== '--force')), { force: rest.includes('--force'), dryRun }, cfg);
+    case 'login': {
+      const ri = rest.indexOf('--region');
+      const region = ri === -1 ? null : (rest[ri + 1] ?? null);
+      if (ri !== -1 && (target !== 'kimi' || !region)) {
+        throw new UsageError('--region <mainland-cn|global> is only valid as "ccswitch kimi login <name> --region <region>"');
+      }
+      const name = rest.find((a, i) => a !== '--force' && a !== '--region' && (ri === -1 || i !== ri + 1));
+      await login(requireName(name), { force: rest.includes('--force'), dryRun, region }, cfg);
       return 0;
+    }
     case 'save':
       saveCurrent(requireName(rest.find((a) => a !== '--force')), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
@@ -1213,7 +1696,7 @@ export async function main(argv = process.argv.slice(2)) {
     case 'run': {
       requireName(rest[0]);
       if (dryRun) {
-        console.log(`[dry-run] would launch ${cfg.claudeBin} with CLAUDE_CONFIG_DIR for "${rest[0]}"`);
+        console.log(`[dry-run] would launch ${cfg.bin} with ${cfg.runEnvVar} for "${rest[0]}"`);
         return 0;
       }
       return runProfile(rest[0], tail, cfg);

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, parseFableLimit, CancelledError, asCancel, reportFatal } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -1305,4 +1305,52 @@ test('reportFatal keeps usage errors terse and real failures debuggable', (t) =>
   assert.doesNotMatch(lines.at(-1), /at .*\(.*\)/);
   assert.equal(reportFatal(new Error('disk on fire')), 1);
   assert.match(lines.at(-1), /at .*\(.*\)/); // unexpected failures keep their stack
+});
+
+// The two bins are the same file; argv[1] is the only thing telling them apart.
+function asBin(t, name) {
+  const orig = process.argv[1];
+  t.after(() => { process.argv[1] = orig; });
+  process.argv[1] = path.join('/usr/local/bin', name);
+}
+
+test('progName follows the invoked bin name, and the target follows it', (t) => {
+  asBin(t, 'kcswitch');
+  assert.equal(progName(), 'kcswitch');
+  assert.equal(defaultTarget(), 'kimi');
+  process.argv[1] = '/usr/local/bin/ccswitch';
+  assert.equal(progName(), 'ccswitch');
+  assert.equal(defaultTarget(), 'claude');
+});
+
+test('cfg.prog is the command a user would retype, cfg.progBin the bin alone', (t) => {
+  sandbox(t);
+  asBin(t, 'ccswitch');
+  assert.equal(config('claude').prog, 'ccswitch');
+  assert.equal(config('claude').progBin, 'ccswitch');
+  assert.equal(config('kimi').prog, 'ccswitch kimi'); // reached via the prefix
+  assert.equal(config('kimi').progBin, 'ccswitch');
+  process.argv[1] = '/usr/local/bin/kcswitch';
+  assert.equal(config('kimi').prog, 'kcswitch'); // no prefix needed under this bin
+  assert.equal(config('kimi').progBin, 'kcswitch');
+});
+
+test('reportFatal names the bin the user actually invoked', (t) => {
+  const lines = captureErr(t);
+  asBin(t, 'kcswitch');
+  assert.equal(reportFatal(new UsageError('no profile named "x"')), 1);
+  assert.equal(lines.at(-1), 'kcswitch: no profile named "x"');
+  process.argv[1] = '/usr/local/bin/ccswitch';
+  reportFatal(new UsageError('no profile named "x"'));
+  assert.equal(lines.at(-1), 'ccswitch: no profile named "x"');
+});
+
+test('cli: ccswitch still names itself ccswitch', (t) => {
+  sandbox(t);
+  const r = runCli(['Not-A-Name!']);
+  assert.match(r.stderr, /^ccswitch: unknown command/);
+  assert.match(r.stderr, /see ccswitch --help/);
+  const help = runCli(['--help']);
+  assert.match(help.stdout, /usage: ccswitch \[--dry-run\]/);
+  assert.match(help.stdout, /\n  ccswitch list /);
 });

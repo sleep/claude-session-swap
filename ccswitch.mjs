@@ -34,11 +34,16 @@ export function asCancel(err) {
   return err;
 }
 
-// Installed under the "kcswitch" bin name, the tool defaults to kimi. Exact
-// match only: anything looser would also catch lookalike paths (test files,
-// editor backups) and silently flip the backend.
+// The same script ships under two bin names; argv[0] is all that separates them.
+// Exact match only: anything looser would also catch lookalike paths (test
+// files, editor backups) and silently flip the backend.
+export function progName() {
+  return path.basename(process.argv[1] ?? '') === 'kcswitch' ? 'kcswitch' : 'ccswitch';
+}
+
+// Installed under the "kcswitch" bin name, the tool defaults to kimi.
 export function defaultTarget() {
-  return path.basename(process.argv[1] ?? '') === 'kcswitch' ? 'kimi' : 'claude';
+  return progName() === 'kcswitch' ? 'kimi' : 'claude';
 }
 
 export function config(target = defaultTarget()) {
@@ -48,7 +53,9 @@ export function config(target = defaultTarget()) {
     const bin = process.env.KCSWITCH_KIMI_BIN || 'kimi';
     return {
       target: 'kimi',
-      prog: 'ccswitch kimi',
+      progBin: progName(),
+      // Under the kcswitch bin the kimi store needs no prefix; under ccswitch it does.
+      prog: progName() === 'kcswitch' ? 'kcswitch' : 'ccswitch kimi',
       toolName: 'Kimi Code',
       home: process.env.KCSWITCH_HOME || path.join(os.homedir(), '.kimi-profiles'),
       credentialsFile:
@@ -64,7 +71,8 @@ export function config(target = defaultTarget()) {
   const bin = process.env.CCSWITCH_CLAUDE_BIN || 'claude';
   return {
     target: 'claude',
-    prog: 'ccswitch',
+    progBin: progName(),
+    prog: progName(),
     toolName: 'Claude Code',
     home: process.env.CCSWITCH_HOME || path.join(os.homedir(), '.claude-profiles'),
     credentialsFile:
@@ -408,7 +416,7 @@ export function loadProfile(name, cfg = config()) {
     return JSON.parse(openBody(fs.readFileSync(profilePath(name, cfg), 'utf8')));
   } catch (err) {
     if (err.code === 'ENOENT') {
-      throw new UsageError(`no profile named "${name}" (run "ccswitch list")`);
+      throw new UsageError(`no profile named "${name}" (run "${cfg.prog} list")`);
     }
     throw err;
   }
@@ -928,7 +936,7 @@ export function exportAll(dest, { force = false, move = false, dryRun = false } 
     entries.push({ name: p.name, credentials, oauthAccount: p.oauthAccount ?? null, savedAt: p.savedAt, tookLive });
   }
   if (entries.length === 0) {
-    throw new UsageError('no profiles to export — save one with "ccswitch save <name>" first');
+    throw new UsageError(`no profiles to export — save one with "${cfg.prog} save <name>" first`);
   }
   if (dryRun) {
     console.log(`[dry-run] would write ${entries.length} profile(s) to ${out}${move ? ' and retire them on this machine' : ''}`);
@@ -1547,25 +1555,46 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
 
 // --- CLI --------------------------------------------------------------------------
 
-const HELP = `usage: ccswitch [--dry-run] <command>
+// Every command line is rendered from this table so the invocation column stays
+// aligned whichever name it is printed under ("kcswitch" and "ccswitch" are the
+// same width, "ccswitch kimi" is not).
+const COMMANDS = [
+  ['', 'pick a profile interactively and switch to it'],
+  ['<name>', 'switch to profile <name>'],
+  ['switch <name>', 'same as above'],
+  ['login <name>', 'log a new account in and save it as <name> (--force re-logs into an existing profile)'],
+  ['save <name>', 'save the current login as <name> (--force overwrites)'],
+  ['run <name> -- [...]', 'one-off BIN session as <name> (no global switch)'],
+  ['list', 'show saved profiles'],
+  ['usage', 'show QUOTA for every profile (refreshes expired tokens)'],
+  ['delete <name>', 'delete a profile (--force skips confirmation)'],
+  ['export <name> [file]', 'write a profile to a plaintext file (--move retires it here)'],
+  ['import <name> [file]', 'load a profile from such a file (--force overwrites)'],
+  ['export-all [file]', 'write ALL profiles + active pointer to one file (--move retires them here)'],
+  ['import-all [file]', 'merge such a file into this machine (--force overwrites existing profiles)'],
+  ['encrypt', 'encrypt profiles, backups and future exports with a passphrase'],
+  ['decrypt', 'turn passphrase encryption back off (rewrites the store as plaintext)'],
+];
 
-  ccswitch                      pick a profile interactively and switch to it
-  ccswitch <name>               switch to profile <name>
-  ccswitch switch <name>        same as above
-  ccswitch login <name>         log a new account in and save it as <name> (--force re-logs into an existing profile)
-  ccswitch save <name>          save the current login as <name> (--force overwrites)
-  ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
-  ccswitch list                 show saved profiles
-  ccswitch usage                show 5h/7d/fable quota for every profile (refreshes expired tokens)
-  ccswitch delete <name>        delete a profile (--force skips confirmation)
-  ccswitch export <name> [file] write a profile to a plaintext file (--move retires it here)
-  ccswitch import <name> [file] load a profile from such a file (--force overwrites)
-  ccswitch export-all [file]    write ALL profiles + active pointer to one file (--move retires them here)
-  ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
-  ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
-  ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
+function help(cfg) {
+  const invocations = COMMANDS.map(([args]) => `  ${cfg.prog}${args && ' '}${args}`);
+  const width = Math.max(...invocations.map((i) => i.length));
+  const quota = cfg.target === 'kimi' ? 'the quota window' : '5h/7d/fable quota';
+  const table = COMMANDS.map(([, desc], i) =>
+    `${invocations[i].padEnd(width)}  ${desc.replace('BIN', cfg.bin).replace('QUOTA', quota)}`,
+  ).join('\n');
 
-Kimi Code accounts: prefix any command with "kimi" — "ccswitch kimi save work",
+  // Both backends are reachable from either bin, so each help text points at the
+  // other one rather than pretending its own store is all there is.
+  const crossRef =
+    cfg.target === 'kimi'
+      ? `This is the Kimi Code store: state lives in ~/.kimi-profiles, the live login
+is ~/.kimi-code/credentials/kimi-code.json, and "run" isolates via
+KIMI_CODE_HOME. "${cfg.prog} login <name>" runs "kimi login" (pass --region
+global for kimi.ai accounts; mainland-cn is the default). Claude Code accounts
+live under the sibling "ccswitch" bin. KCSWITCH_* env vars mirror the CCSWITCH_*
+ones; CCSWITCH_PASSPHRASE and KCSWITCH_PASSPHRASE both work for either store.`
+      : `Kimi Code accounts: prefix any command with "kimi" — "ccswitch kimi save work",
 "ccswitch kimi work", "ccswitch kimi run work -- -p ...", "ccswitch kimi usage",
 and so on through the whole command set. "ccswitch kimi login <name>" runs
 "kimi login" (pass --region global for kimi.ai accounts; mainland-cn is the
@@ -1574,21 +1603,29 @@ default). Kimi state lives in ~/.kimi-profiles, the live login is
 Installed under the "kcswitch" bin name, the tool targets kimi without the
 prefix. (A claude profile literally named "kimi" stays reachable via
 "ccswitch switch kimi".) KCSWITCH_* env vars mirror the CCSWITCH_* ones;
-CCSWITCH_PASSPHRASE and KCSWITCH_PASSPHRASE both work for either store.
+CCSWITCH_PASSPHRASE and KCSWITCH_PASSPHRASE both work for either store.`;
+
+  const store = cfg.target === 'kimi' ? '~/.kimi-profiles' : '~/.claude-profiles';
+  return `usage: ${cfg.prog} [--dry-run] <command>
+
+${table}
+
+${crossRef}
 
 Tokens rotate on every refresh, so each chain works from ONE machine only; a
 chain used from two machines gets the account logged out everywhere. For a
-second machine that stays in use, run "ccswitch login <name>" there: accounts
+second machine that stays in use, run "${cfg.prog} login <name>" there: accounts
 may be logged in from several machines, each with its own chain. To migrate
 instead, use "export-all --move" / "import-all": --move retires the source
 copies so this machine cannot revoke the moved chains later.
 
-State lives in ~/.claude-profiles. Every mutation writes a backup there first.
-Unencrypted stores keep tokens in plaintext; run "ccswitch encrypt" to protect
+State lives in ${store}. Every mutation writes a backup there first.
+Unencrypted stores keep tokens in plaintext; run "${cfg.prog} encrypt" to protect
 them at rest. CCSWITCH_PASSPHRASE skips the interactive passphrase prompt.`;
+}
 
-function requireName(name) {
-  if (!name) throw new UsageError('missing profile name (see ccswitch --help)');
+function requireName(name, cfg) {
+  if (!name) throw new UsageError(`missing profile name (see ${cfg.progBin} --help)`);
   return name;
 }
 
@@ -1623,7 +1660,7 @@ export async function main(argv = process.argv.slice(2)) {
   const cfg = config(target);
 
   if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
-    console.log(HELP);
+    console.log(help(cfg));
     return 0;
   }
   // Resolve the passphrase up front whenever this invocation will need to
@@ -1652,17 +1689,17 @@ export async function main(argv = process.argv.slice(2)) {
       const ri = rest.indexOf('--region');
       const region = ri === -1 ? null : (rest[ri + 1] ?? null);
       if (ri !== -1 && (target !== 'kimi' || !region)) {
-        throw new UsageError('--region <mainland-cn|global> is only valid as "ccswitch kimi login <name> --region <region>"');
+        throw new UsageError(`--region <mainland-cn|global> is only valid as "${config('kimi').prog} login <name> --region <region>"`);
       }
       const name = rest.find((a, i) => a !== '--force' && a !== '--region' && (ri === -1 || i !== ri + 1));
-      await login(requireName(name), { force: rest.includes('--force'), dryRun, region }, cfg);
+      await login(requireName(name, cfg), { force: rest.includes('--force'), dryRun, region }, cfg);
       return 0;
     }
     case 'save':
-      saveCurrent(requireName(rest.find((a) => a !== '--force')), { force: rest.includes('--force'), dryRun }, cfg);
+      saveCurrent(requireName(rest.find((a) => a !== '--force'), cfg), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'switch':
-      switchTo(requireName(rest[0]), { dryRun }, cfg);
+      switchTo(requireName(rest[0], cfg), { dryRun }, cfg);
       return 0;
     case 'list':
       console.log(formatList(cfg));
@@ -1670,16 +1707,16 @@ export async function main(argv = process.argv.slice(2)) {
     case 'usage':
       return usageCmd({ dryRun }, cfg);
     case 'delete':
-      await deleteProfileCmd(requireName(rest[0]), { force: rest.includes('--force'), dryRun }, cfg);
+      await deleteProfileCmd(requireName(rest[0], cfg), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'export': {
       const pos = rest.filter((a) => a !== '--force' && a !== '--move');
-      exportProfile(requireName(pos[0]), pos[1], { force: rest.includes('--force'), move: rest.includes('--move'), dryRun }, cfg);
+      exportProfile(requireName(pos[0], cfg), pos[1], { force: rest.includes('--force'), move: rest.includes('--move'), dryRun }, cfg);
       return 0;
     }
     case 'import': {
       const pos = rest.filter((a) => a !== '--force');
-      importProfile(requireName(pos[0]), pos[1], { force: rest.includes('--force'), dryRun }, cfg);
+      importProfile(requireName(pos[0], cfg), pos[1], { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     }
     case 'export-all': {
@@ -1712,7 +1749,7 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     }
     case 'run': {
-      requireName(rest[0]);
+      requireName(rest[0], cfg);
       if (dryRun) {
         console.log(`[dry-run] would launch ${cfg.bin} with ${cfg.runEnvVar} for "${rest[0]}"`);
         return 0;
@@ -1724,7 +1761,7 @@ export async function main(argv = process.argv.slice(2)) {
         switchTo(cmd, { dryRun }, cfg); // shorthand: ccswitch <name>
         return 0;
       }
-      throw new UsageError(`unknown command ${JSON.stringify(cmd)} (see ccswitch --help)`);
+      throw new UsageError(`unknown command ${JSON.stringify(cmd)} (see ${cfg.progBin} --help)`);
   }
 }
 
@@ -1744,7 +1781,7 @@ export function reportFatal(err) {
     console.error('\naborted');
     return 130; // 128 + SIGINT, so callers can tell a cancel from a failure
   }
-  console.error(`ccswitch: ${err instanceof UsageError ? err.message : (err.stack ?? err.message)}`);
+  console.error(`${progName()}: ${err instanceof UsageError ? err.message : (err.stack ?? err.message)}`);
   return 1;
 }
 

@@ -840,3 +840,46 @@ test('cli: the kcswitch bin name makes kimi the default target', (t) => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /work +Shy/); // the kimi store, without any "kimi" argument
 });
+
+// Both bins are the same script; only argv[0] differs, so every message the
+// kimi bin prints has to name itself rather than its sibling.
+function kcBin(home) {
+  const alias = path.join(home, 'kcswitch');
+  fs.copyFileSync(CLI, alias);
+  fs.chmodSync(alias, 0o755);
+  return alias;
+}
+
+test('cli: kcswitch names itself in errors, not ccswitch', (t) => {
+  const { home } = sandbox(t);
+  const r = spawnSync(kcBin(home), ['Not-A-Name!'], { encoding: 'utf8', env: { ...process.env, ...kimiEnv() } });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^kcswitch: unknown command/);
+  assert.match(r.stderr, /see kcswitch --help/);
+  assert.doesNotMatch(r.stderr, /ccswitch/);
+});
+
+test('cli: kcswitch --help spells its own commands without the kimi prefix', (t) => {
+  const { home } = sandbox(t);
+  const r = spawnSync(kcBin(home), ['--help'], { encoding: 'utf8', env: { ...process.env, ...kimiEnv() } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /usage: kcswitch \[--dry-run\]/);
+  assert.match(r.stdout, /\n  kcswitch login <name> /);
+  assert.match(r.stdout, /kcswitch encrypt/);
+  assert.doesNotMatch(r.stdout, /\n  ccswitch /); // no command line addressed to the other bin
+});
+
+test('cli: ccswitch kimi --help keeps the prefix in every command it prints', (t) => {
+  sandbox(t);
+  const r = runCli(['kimi', '--help'], kimiEnv());
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /usage: ccswitch kimi \[--dry-run\]/);
+  assert.match(r.stdout, /\n  ccswitch kimi login <name> /);
+});
+
+test('cli: a kimi usage error reached through the prefix is prefixed ccswitch', (t) => {
+  sandbox(t);
+  const r = runCli(['kimi', 'Not-A-Name!'], kimiEnv());
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^ccswitch: unknown command/);
+});

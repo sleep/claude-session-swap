@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, parseFableLimit } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, parseFableLimit, CancelledError, asCancel, reportFatal } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -1270,4 +1270,39 @@ test('main routes export-all --move', async (t) => {
   captureLog(t);
   assert.equal(await main(['export-all', out, '--move']), 0);
   assert.ok(loadProfile('work', cfg).movedAt);
+});
+
+function captureErr(t) {
+  const lines = [];
+  const orig = console.error;
+  console.error = (...a) => lines.push(a.join(' '));
+  t.after(() => { console.error = orig; });
+  return lines;
+}
+
+test('asCancel turns a readline Ctrl+C abort into a cancel and passes everything else through', () => {
+  // What readline/promises actually rejects a pending question with on Ctrl+C.
+  const ctrlC = Object.assign(new Error('Aborted with Ctrl+C'), { name: 'AbortError', code: 'ABORT_ERR' });
+  assert.ok(asCancel(ctrlC) instanceof CancelledError);
+  // DOMException-shaped aborts carry a numeric .code, so the name is the fallback.
+  assert.ok(asCancel(new DOMException('Aborted', 'AbortError')) instanceof CancelledError);
+  const real = new Error('disk on fire');
+  assert.equal(asCancel(real), real);
+  assert.equal(asCancel(new UsageError('nope')) instanceof CancelledError, false);
+});
+
+test('reportFatal exits 130 on a cancel and never prints a stack trace for it', (t) => {
+  const lines = captureErr(t);
+  assert.equal(reportFatal(new CancelledError()), 130); // 128 + SIGINT
+  assert.equal(lines.join('\n').trim(), 'aborted');
+  assert.doesNotMatch(lines.join('\n'), /at .*\(.*\)/);
+});
+
+test('reportFatal keeps usage errors terse and real failures debuggable', (t) => {
+  const lines = captureErr(t);
+  assert.equal(reportFatal(new UsageError('no profile named "x"')), 1);
+  assert.equal(lines.at(-1), 'ccswitch: no profile named "x"');
+  assert.doesNotMatch(lines.at(-1), /at .*\(.*\)/);
+  assert.equal(reportFatal(new Error('disk on fire')), 1);
+  assert.match(lines.at(-1), /at .*\(.*\)/); // unexpected failures keep their stack
 });

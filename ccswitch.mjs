@@ -20,6 +20,20 @@ import { pathToFileURL } from 'node:url';
 
 export class UsageError extends Error {}
 
+// A prompt the user walked away from, as opposed to something going wrong.
+export class CancelledError extends Error {}
+
+// readline/promises does not let Ctrl+C at a prompt raise SIGINT: it rejects the
+// pending question with an AbortError instead. Left alone that reads as a crash,
+// so translate it into a cancel. Node's AbortError carries code ABORT_ERR while a
+// DOMException-shaped one carries a numeric code, hence the two checks.
+export function asCancel(err) {
+  if (err?.code === 'ABORT_ERR' || err?.name === 'AbortError') {
+    return new CancelledError('cancelled at a prompt');
+  }
+  return err;
+}
+
 // Installed under the "kcswitch" bin name, the tool defaults to kimi. Exact
 // match only: anything looser would also catch lookalike paths (test files,
 // editor backups) and silently flip the backend.
@@ -318,6 +332,8 @@ async function promptHidden(question) {
     const answer = await rl.question('');
     process.stdout.write('\n');
     return answer.trim();
+  } catch (err) {
+    throw asCancel(err);
   } finally {
     rl.close();
   }
@@ -609,6 +625,8 @@ async function promptLine(question) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
     return (await rl.question(question)).trim();
+  } catch (err) {
+    throw asCancel(err);
   } finally {
     rl.close();
   }
@@ -1719,11 +1737,19 @@ const invokedDirectly = (() => {
   }
 })();
 
+// Returns the exit status so the failure paths stay testable without spawning.
+export function reportFatal(err) {
+  if (err instanceof CancelledError) {
+    // The prompt left the cursor mid-line; the newline keeps "aborted" off it.
+    console.error('\naborted');
+    return 130; // 128 + SIGINT, so callers can tell a cancel from a failure
+  }
+  console.error(`ccswitch: ${err instanceof UsageError ? err.message : (err.stack ?? err.message)}`);
+  return 1;
+}
+
 if (invokedDirectly) {
   main()
     .then((code) => process.exit(code ?? 0))
-    .catch((err) => {
-      console.error(`ccswitch: ${err instanceof UsageError ? err.message : (err.stack ?? err.message)}`);
-      process.exit(1);
-    });
+    .catch((err) => process.exit(reportFatal(err)));
 }

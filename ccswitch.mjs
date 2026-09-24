@@ -1700,7 +1700,6 @@ async function pickIndex(header, rows, initialIdx) {
   const gutter = '  ';
 
   console.log(`${gutter}${headerLine}`);
-  console.log('(↑/↓, j/k, or w/s to move, enter to select, q to cancel)');
 
   let idx = Math.min(Math.max(initialIdx, 0), n - 1);
   const draw = (first) => {

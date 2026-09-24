@@ -697,11 +697,11 @@ test('kimiUsageCmd fails soft per profile and only exits 1 when all fail', async
   };
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /logged out — run "ccswitch kimi login dead --force"/);
+  assert.match(lines.join('\n'), /logged out/);
   saveProfile('gone', { credentials: kimiCreds({ sub: 'u-x' }), oauthAccount: { userId: 'u-x' }, movedAt: new Date().toISOString() }, cfg);
   lines.length = 0;
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /moved to another machine; run "ccswitch kimi login gone" to use it here/);
+  assert.match(lines.join('\n'), /moved to another machine/);
 });
 
 test('kimiUsageCmd --dry-run touches the network never', async (t) => {

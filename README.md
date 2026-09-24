@@ -71,7 +71,7 @@ ccswitch run work -- -p "summarize this repo"
    name      email          5h          resets    7d          resets    fable       resets    status
 *  personal  me@gmail.com   ███▏   63%  in 2h04m  █      19%  in 5d21h  ██▌    49%  in 4d02h  ok
    work      me@corp.com    ██▉    58%  in 3h27m  ████▎  84%  in 5d23h  -           -         ok (refreshed)
-   old       old@gmail.com  -           -         -           -         -           -         logged out — run "ccswitch login old --force"
+   old       old@gmail.com  -           -         -           -         -           -         logged out
 ```
 
 `fable` is Fable's own weekly cap, reported separately from the general 7d window; it shows `-` on accounts that have no such cap. It queries Anthropic's OAuth usage endpoint with each profile's stored token. Expired access tokens are refreshed first, and the rotated token pair is written back to the profile *before* it's used — so a crash can never lose a login. Valid tokens are never refreshed (no pointless rotation), and a profile whose chain is dead just shows `logged out` without breaking the others.
@@ -100,7 +100,7 @@ Differences from the claude side, all consequences of how kimi stores its login:
 ```
    name  account  week        resets    limits                  booster  status
 *  main  Shy      ██▉    58%  in 3d04h  5h ▏       4% in 1h12m  $9.50    ok
-   alt   u2abc…   -           -         -                     -        logged out — run "ccswitch kimi login alt --force"
+   alt   u2abc…   -           -         -                     -        logged out
 ```
 
 Kimi refresh tokens rotate on refresh exactly like claude's, so all the multi-machine rules below apply unchanged: one chain, one machine; `export --move` / `export-all --move` to migrate.

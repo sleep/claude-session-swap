@@ -1004,6 +1004,14 @@ test('renderTable aligns columns ignoring ANSI escapes', () => {
   assert.equal(lines[1].indexOf('y'), lines[2].indexOf('w'));
 });
 
+test('renderTable clips rows to maxWidth without splitting escapes', () => {
+  const out = renderTable(['a', 'status'], [['\x1b[31mxx\x1b[0m', 'a long status message']], 12);
+  for (const line of out.split('\n')) assert.ok(line.replace(/\x1b\[[0-9;]*m/g, '').length <= 12);
+  const row = out.split('\n')[1];
+  assert.equal(row.replace(/\x1b\[[0-9;]*m/g, ''), 'xx  a long s');
+  assert.ok(row.endsWith('\x1b[0m'));
+});
+
 test('usageCmd refreshes expired tokens and persists before the usage call', async (t) => {
   sandbox(t);
   const cfg = config();
@@ -1058,7 +1066,7 @@ test('usageCmd fails soft per profile and only exits 1 when all fail', async (t)
   };
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /logged out — run "ccswitch login dead --force"/);
+  assert.match(lines.join('\n'), /logged out/);
   deleteProfileFile('good', cfg);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
 });

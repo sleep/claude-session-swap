@@ -1390,12 +1390,32 @@ export function formatResetIn(resetsAt, now = Date.now()) {
 // terminal columns — alignment must measure visible width only.
 const visibleWidth = (s) => String(s).replace(/\x1b\[[0-9;]*m/g, '').length;
 
-export function renderTable(header, rows) {
+// Cut a line to `max` visible columns without splitting an escape sequence,
+// resetting attributes so a clipped color can't bleed into the next line.
+function clipLine(line, max) {
+  if (visibleWidth(line) <= max) return line;
+  let out = '';
+  let cols = 0;
+  for (const tok of line.match(/\x1b\[[0-9;]*m|[^\x1b]/g) ?? []) {
+    if (tok.startsWith('\x1b')) out += tok;
+    else if (cols < max) {
+      out += tok;
+      cols++;
+    }
+  }
+  return out.includes('\x1b') ? out + '\x1b[0m' : out;
+}
+
+// `maxWidth` keeps each row to one terminal line: overflow is cut off rather
+// than wrapped, so a narrow terminal loses the tail of the status column.
+export function renderTable(header, rows, maxWidth = Infinity) {
   const widths = header.map((h, i) => Math.max(visibleWidth(h), ...rows.map((r) => visibleWidth(r[i]))));
   return [header, ...rows]
-    .map((r) => r.map((c, i) => String(c) + ' '.repeat(widths[i] - visibleWidth(c))).join('  ').trimEnd())
+    .map((r) => clipLine(r.map((c, i) => String(c) + ' '.repeat(widths[i] - visibleWidth(c))).join('  ').trimEnd(), maxWidth))
     .join('\n');
 }
+
+const terminalWidth = () => (process.stdout.isTTY && process.stdout.columns) || Infinity;
 
 export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
   if (cfg.target === 'kimi') return kimiUsageCmd({ dryRun }, cfg, fetchImpl);
@@ -1424,7 +1444,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       // would revoke it there.
       rows.push([
         isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-', '-', '-',
-        `moved to another machine; run "${cfg.prog} login ${p.name}" to use it here`,
+        'moved to another machine',
       ]);
       continue;
     }
@@ -1444,7 +1464,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       usage = await fetchUsage(credentials, fetchImpl);
       succeeded++;
     } catch (err) {
-      status = err instanceof AuthDeadError ? `logged out — run "${cfg.prog} login ${p.name} --force"` : `error: ${err.message}`;
+      status = err instanceof AuthDeadError ? 'logged out' : `error: ${err.message}`;
     }
     rows.push([
       isActive ? '*' : ' ',
@@ -1460,7 +1480,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
     ]);
   }
   console.log(
-    renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'], rows),
+    renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'], rows, terminalWidth()),
   );
   return succeeded > 0 ? 0 : 1;
 }
@@ -1494,7 +1514,7 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
       // would revoke it there.
       rows.push([
         isActive ? '*' : ' ', p.name, account, '-', '-', '-', '-',
-        `moved to another machine; run "${cfg.prog} login ${p.name}" to use it here`,
+        'moved to another machine',
       ]);
       continue;
     }
@@ -1530,7 +1550,7 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
         }
       }
     } catch (err) {
-      status = err instanceof AuthDeadError ? `logged out — run "${cfg.prog} login ${p.name} --force"` : `error: ${err.message}`;
+      status = err instanceof AuthDeadError ? 'logged out' : `error: ${err.message}`;
     }
     rows.push([
       isActive ? '*' : ' ',
@@ -1549,7 +1569,7 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
       status,
     ]);
   }
-  console.log(renderTable([' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', 'status'], rows));
+  console.log(renderTable([' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', 'status'], rows, terminalWidth()));
   return succeeded > 0 ? 0 : 1;
 }
 

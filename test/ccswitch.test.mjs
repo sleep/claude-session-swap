@@ -779,10 +779,11 @@ test('cli: encrypt via CCSWITCH_PASSPHRASE, list works, decrypt restores', (t) =
 
 const CLI = new URL('../ccswitch.mjs', import.meta.url).pathname;
 
-function runCli(args, env = {}) {
+function runCli(args, env = {}, input) {
   return spawnSync(process.execPath, [CLI, ...args], {
     encoding: 'utf8',
     env: { ...process.env, ...env },
+    input,
   });
 }
 
@@ -805,6 +806,30 @@ test('cli: list works end to end', (t) => {
   });
   assert.equal(r.status, 0);
   assert.match(r.stdout, /work +w@x\.com/);
+});
+
+test('cli: bare invocation falls back to a numbered prompt when stdin is not a TTY', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: null, oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  saveProfile('home', { credentials: null, oauthAccount: { emailAddress: 'h@x.com' } }, cfg);
+  // --dry-run so the picker skips the network usage fetch entirely (a piped,
+  // non-TTY stdin can't drive the arrow-key picker either way).
+  // Profiles list alphabetically: 1) home, 2) work.
+  const r = runCli(['--dry-run'], {}, '1\n');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /#\s+name\s+account/);
+  assert.match(r.stdout, /1\s+home\s+h@x\.com/);
+  assert.match(r.stdout, /would .*activate "home"/);
+});
+
+test('cli: bare invocation rejects an out-of-range selection', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: null, oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const r = runCli(['--dry-run'], {}, '9\n');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /invalid selection/);
 });
 
 test('cli: unknown command errors cleanly without a stack trace', (t) => {

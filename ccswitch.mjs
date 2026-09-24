@@ -16,6 +16,7 @@ import { Writable } from 'node:stream';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
+import { emitKeypressEvents } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
 export class UsageError extends Error {}
@@ -1673,28 +1674,92 @@ function requireName(name, cfg) {
   return name;
 }
 
+// Arrow keys / wasd / vim keys move the highlight, enter selects. Falls back
+// to a numbered prompt when stdin or stdout isn't a TTY (piped, redirected,
+// or a non-interactive CI shell can't do raw-mode keypress reading at all).
+async function pickIndex(header, rows, initialIdx) {
+  const n = rows.length;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    const numbered = rows.map((r, i) => [String(i + 1), ...r]);
+    console.log(renderTable(['#', ...header], numbered, terminalWidth()));
+    const answer = await promptLine('Switch to: ');
+    const idx = Number(answer) - 1;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= n) {
+      throw new UsageError(`invalid selection ${JSON.stringify(answer)}`);
+    }
+    return idx;
+  }
+
+  const width = terminalWidth();
+  // Reserve the 2-column gutter the pointer prints into so a full-width row
+  // plus pointer doesn't wrap and throw off the cursor-up redraw math below.
+  const rowWidth = Number.isFinite(width) ? Math.max(10, width - 2) : width;
+  const [headerLine, ...rowLines] = renderTable(header, rows, rowWidth).split('\n');
+  const color = shouldUseColor();
+  const pointer = color ? '\x1b[36m❯\x1b[39m ' : '> ';
+  const gutter = '  ';
+
+  console.log(`${gutter}${headerLine}`);
+  console.log('(↑/↓, j/k, or w/s to move, enter to select, q to cancel)');
+
+  let idx = Math.min(Math.max(initialIdx, 0), n - 1);
+  const draw = (first) => {
+    if (!first) process.stdout.write(`\x1b[${n}A`);
+    for (let i = 0; i < n; i++) {
+      process.stdout.write(`\x1b[2K${i === idx ? pointer : gutter}${rowLines[i]}\n`);
+    }
+  };
+  draw(true);
+
+  process.stdout.write('\x1b[?25l'); // hide the cursor while the list is live
+  try {
+    return await new Promise((resolve, reject) => {
+      const finish = (settle, value) => {
+        process.stdin.removeListener('keypress', onKeypress);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        settle(value);
+      };
+      const onKeypress = (str, key = {}) => {
+        if (key.ctrl && key.name === 'c') return finish(reject, new CancelledError('cancelled at a prompt'));
+        if (key.name === 'escape' || key.name === 'q') return finish(reject, new CancelledError('cancelled at a prompt'));
+        if (key.name === 'return' || key.name === 'enter') return finish(resolve, idx);
+        if (key.name === 'up' || key.name === 'k' || key.name === 'w') {
+          idx = (idx - 1 + n) % n;
+          draw(false);
+        } else if (key.name === 'down' || key.name === 'j' || key.name === 's') {
+          idx = (idx + 1) % n;
+          draw(false);
+        }
+      };
+      emitKeypressEvents(process.stdin);
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.on('keypress', onKeypress);
+    });
+  } finally {
+    process.stdout.write('\x1b[?25h'); // always restore the cursor, cancel or not
+  }
+}
+
 async function pickProfile(cfg, { dryRun = false } = {}, fetchImpl = fetch) {
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
     throw new UsageError(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
   }
   const active = getActive(cfg);
+  const activeIdx = Math.max(0, profiles.findIndex((p) => p.name === active));
+  let header, rows;
   if (dryRun) {
     // Fetching limits refreshes expired tokens, a real write; skip it so
-    // --dry-run stays a true no-op and fall back to the plain name list.
-    for (const [i, p] of profiles.entries()) {
-      console.log(`${i + 1}) ${p.name === active ? '*' : ' '} ${p.name} (${displayAccount(p.oauthAccount) ?? '-'})`);
-    }
+    // --dry-run stays a true no-op and show the plain name list instead.
+    header = [' ', 'name', 'account'];
+    rows = profiles.map((p) => [p.name === active ? '*' : ' ', p.name, displayAccount(p.oauthAccount) ?? '-']);
   } else {
     const rowsFn = cfg.target === 'kimi' ? kimiUsageRows : claudeUsageRows;
-    const { header, rows } = await rowsFn(profiles, active, cfg, fetchImpl, shouldUseColor());
-    console.log(renderTable(['#', ...header], rows.map((r, i) => [String(i + 1), ...r]), terminalWidth()));
+    ({ header, rows } = await rowsFn(profiles, active, cfg, fetchImpl, shouldUseColor()));
   }
-  const answer = await promptLine('Switch to: ');
-  const idx = Number(answer) - 1;
-  if (!Number.isInteger(idx) || idx < 0 || idx >= profiles.length) {
-    throw new UsageError(`invalid selection ${JSON.stringify(answer)}`);
-  }
+  const idx = await pickIndex(header, rows, activeIdx);
   return profiles[idx].name;
 }
 

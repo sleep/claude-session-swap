@@ -1427,24 +1427,12 @@ export function shouldUseColor(env = process.env) {
   return true;
 }
 
-export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
-  if (cfg.target === 'kimi') return kimiUsageCmd({ dryRun }, cfg, fetchImpl);
-  const profiles = listProfiles(cfg);
-  if (profiles.length === 0) {
-    console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
-    return 0;
-  }
-  const active = getActive(cfg);
-  if (dryRun) {
-    for (const p of profiles) {
-      const credentials = p.name === active ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
-      console.log(
-        `[dry-run] would query usage for "${p.name}"${tokenExpired(credentials) ? ' (needs token refresh first)' : ''}`,
-      );
-    }
-    return 0;
-  }
-  const color = shouldUseColor();
+const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'];
+
+// Shared by usageCmd (prints the table as-is) and pickProfile (adds a "#"
+// column and prompts for a selection), so the picker's per-account limits
+// stay driven by the exact same fetch/refresh/error logic as `usage`.
+async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
   const rows = [];
   let succeeded = 0;
   for (const p of profiles) {
@@ -1489,15 +1477,11 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
       status,
     ]);
   }
-  console.log(
-    renderTable([' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'], rows, terminalWidth()),
-  );
-  return succeeded > 0 ? 0 : 1;
+  return { header: CLAUDE_USAGE_HEADER, rows, succeeded };
 }
 
-// Kimi's /usages shape differs from claude's: a weekly summary row, extra
-// scoped limit windows, and a booster wallet balance. Columns follow suit.
-export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi'), fetchImpl = fetch) {
+export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
+  if (cfg.target === 'kimi') return kimiUsageCmd({ dryRun }, cfg, fetchImpl);
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
     console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
@@ -1513,7 +1497,17 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
     }
     return 0;
   }
-  const color = shouldUseColor();
+  const { header, rows, succeeded } = await claudeUsageRows(profiles, active, cfg, fetchImpl, shouldUseColor());
+  console.log(renderTable(header, rows, terminalWidth()));
+  return succeeded > 0 ? 0 : 1;
+}
+
+const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', 'status'];
+
+// Kimi's /usages shape differs from claude's: a weekly summary row, extra
+// scoped limit windows, and a booster wallet balance. Columns follow suit.
+// Shared by kimiUsageCmd and pickProfile, same reason as claudeUsageRows above.
+async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
   const rows = [];
   let succeeded = 0;
   for (const p of profiles) {
@@ -1579,7 +1573,27 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
       status,
     ]);
   }
-  console.log(renderTable([' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', 'status'], rows, terminalWidth()));
+  return { header: KIMI_USAGE_HEADER, rows, succeeded };
+}
+
+export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi'), fetchImpl = fetch) {
+  const profiles = listProfiles(cfg);
+  if (profiles.length === 0) {
+    console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
+    return 0;
+  }
+  const active = getActive(cfg);
+  if (dryRun) {
+    for (const p of profiles) {
+      const credentials = p.name === active ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+      console.log(
+        `[dry-run] would query usage for "${p.name}"${tokenExpired(credentials) ? ' (needs token refresh first)' : ''}`,
+      );
+    }
+    return 0;
+  }
+  const { header, rows, succeeded } = await kimiUsageRows(profiles, active, cfg, fetchImpl, shouldUseColor());
+  console.log(renderTable(header, rows, terminalWidth()));
   return succeeded > 0 ? 0 : 1;
 }
 
@@ -1589,7 +1603,7 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
 // aligned whichever name it is printed under ("kcswitch" and "ccswitch" are the
 // same width, "ccswitch kimi" is not).
 const COMMANDS = [
-  ['', 'pick a profile interactively and switch to it'],
+  ['', 'show QUOTA for every profile, then pick one interactively to switch to'],
   ['<name>', 'switch to profile <name>'],
   ['switch <name>', 'same as above'],
   ['login <name>', 'log a new account in and save it as <name> (--force re-logs into an existing profile)'],
@@ -1659,14 +1673,22 @@ function requireName(name, cfg) {
   return name;
 }
 
-async function pickProfile(cfg) {
+async function pickProfile(cfg, { dryRun = false } = {}, fetchImpl = fetch) {
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
     throw new UsageError(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
   }
   const active = getActive(cfg);
-  for (const [i, p] of profiles.entries()) {
-    console.log(`${i + 1}) ${p.name === active ? '*' : ' '} ${p.name} (${displayAccount(p.oauthAccount) ?? '-'})`);
+  if (dryRun) {
+    // Fetching limits refreshes expired tokens, a real write; skip it so
+    // --dry-run stays a true no-op and fall back to the plain name list.
+    for (const [i, p] of profiles.entries()) {
+      console.log(`${i + 1}) ${p.name === active ? '*' : ' '} ${p.name} (${displayAccount(p.oauthAccount) ?? '-'})`);
+    }
+  } else {
+    const rowsFn = cfg.target === 'kimi' ? kimiUsageRows : claudeUsageRows;
+    const { header, rows } = await rowsFn(profiles, active, cfg, fetchImpl, shouldUseColor());
+    console.log(renderTable(['#', ...header], rows.map((r, i) => [String(i + 1), ...r]), terminalWidth()));
   }
   const answer = await promptLine('Switch to: ');
   const idx = Number(answer) - 1;
@@ -1711,7 +1733,7 @@ export async function main(argv = process.argv.slice(2)) {
     await requirePassphrase();
   }
   if (!cmd) {
-    switchTo(await pickProfile(cfg), { dryRun }, cfg);
+    switchTo(await pickProfile(cfg, { dryRun }), { dryRun }, cfg);
     return 0;
   }
   switch (cmd) {

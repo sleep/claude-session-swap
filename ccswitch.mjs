@@ -1417,6 +1417,16 @@ export function renderTable(header, rows, maxWidth = Infinity) {
 
 const terminalWidth = () => (process.stdout.isTTY && process.stdout.columns) || Infinity;
 
+// Node/CLI color convention: NO_COLOR disables regardless of TTY, FORCE_COLOR
+// enables regardless of TTY. The override matters because piping through a
+// wrapper like `watch --color` makes our stdout a pipe (isTTY false) even
+// though the wrapper will render any ANSI codes we still emit.
+export function shouldUseColor(env = process.env) {
+  if (env.NO_COLOR) return false;
+  if (env.FORCE_COLOR && env.FORCE_COLOR !== '0') return true;
+  return process.stdout.isTTY === true;
+}
+
 export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
   if (cfg.target === 'kimi') return kimiUsageCmd({ dryRun }, cfg, fetchImpl);
   const profiles = listProfiles(cfg);
@@ -1434,7 +1444,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
     }
     return 0;
   }
-  const color = process.stdout.isTTY === true;
+  const color = shouldUseColor();
   const rows = [];
   let succeeded = 0;
   for (const p of profiles) {
@@ -1503,7 +1513,7 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
     }
     return 0;
   }
-  const color = process.stdout.isTTY === true;
+  const color = shouldUseColor();
   const rows = [];
   let succeeded = 0;
   for (const p of profiles) {

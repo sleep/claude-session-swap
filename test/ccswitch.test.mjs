@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -985,6 +985,13 @@ test('formatBar renders fixed-width bars, clamps, and colors by threshold', () =
   assert.match(formatBar(58, { color: true }), /^\x1b\[32m/); // green < 60
   assert.match(formatBar(70, { color: true }), /^\x1b\[33m/); // yellow 60–85
   assert.match(formatBar(90, { color: true }), /^\x1b\[31m/); // red > 85
+});
+
+test('shouldUseColor honors NO_COLOR and FORCE_COLOR overrides', () => {
+  assert.equal(shouldUseColor({ NO_COLOR: '1', FORCE_COLOR: '1' }), false); // NO_COLOR wins
+  assert.equal(shouldUseColor({ FORCE_COLOR: '1' }), true);
+  assert.equal(shouldUseColor({ FORCE_COLOR: '0' }), process.stdout.isTTY === true); // '0' is not a force
+  assert.equal(shouldUseColor({}), process.stdout.isTTY === true);
 });
 
 test('formatResetIn picks the right granularity', () => {

@@ -1417,14 +1417,14 @@ export function renderTable(header, rows, maxWidth = Infinity) {
 
 const terminalWidth = () => (process.stdout.isTTY && process.stdout.columns) || Infinity;
 
-// Node/CLI color convention: NO_COLOR disables regardless of TTY, FORCE_COLOR
-// enables regardless of TTY. The override matters because piping through a
-// wrapper like `watch --color` makes our stdout a pipe (isTTY false) even
-// though the wrapper will render any ANSI codes we still emit.
+// Color defaults on, TTY or not: usage is routinely piped through wrappers
+// like `watch --color`, which render any ANSI we emit even though our own
+// stdout is a pipe there. NO_COLOR (or FORCE_COLOR=0) opts back out, per the
+// standard CLI convention, for callers that want plain text.
 export function shouldUseColor(env = process.env) {
   if (env.NO_COLOR) return false;
-  if (env.FORCE_COLOR && env.FORCE_COLOR !== '0') return true;
-  return process.stdout.isTTY === true;
+  if (env.FORCE_COLOR === '0') return false;
+  return true;
 }
 
 export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {

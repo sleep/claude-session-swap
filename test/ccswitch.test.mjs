@@ -987,11 +987,12 @@ test('formatBar renders fixed-width bars, clamps, and colors by threshold', () =
   assert.match(formatBar(90, { color: true }), /^\x1b\[31m/); // red > 85
 });
 
-test('shouldUseColor honors NO_COLOR and FORCE_COLOR overrides', () => {
+test('shouldUseColor defaults on, TTY or not, unless NO_COLOR/FORCE_COLOR=0 opts out', () => {
+  assert.equal(shouldUseColor({}), true);
+  assert.equal(shouldUseColor({ NO_COLOR: '1' }), false);
+  assert.equal(shouldUseColor({ FORCE_COLOR: '0' }), false);
   assert.equal(shouldUseColor({ NO_COLOR: '1', FORCE_COLOR: '1' }), false); // NO_COLOR wins
   assert.equal(shouldUseColor({ FORCE_COLOR: '1' }), true);
-  assert.equal(shouldUseColor({ FORCE_COLOR: '0' }), process.stdout.isTTY === true); // '0' is not a force
-  assert.equal(shouldUseColor({}), process.stdout.isTTY === true);
 });
 
 test('formatResetIn picks the right granularity', () => {
@@ -1080,6 +1081,10 @@ test('usageCmd fails soft per profile and only exits 1 when all fail', async (t)
 
 test('usageCmd renders the fable window and keeps every row column-aligned', async (t) => {
   sandbox(t);
+  // Column positions are checked by raw string index below, so ANSI color
+  // codes (on by default even off a TTY) would throw the count off.
+  process.env.NO_COLOR = '1';
+  t.after(() => delete process.env.NO_COLOR);
   const cfg = config();
   const creds = () =>
     JSON.stringify({ claudeAiOauth: { accessToken: 'at', refreshToken: 'rt', expiresAt: Date.now() + 3600000 } });

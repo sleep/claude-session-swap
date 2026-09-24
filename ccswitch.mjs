@@ -47,6 +47,14 @@ export function defaultTarget() {
   return progName() === 'kcswitch' ? 'kimi' : 'claude';
 }
 
+// Last-known usage per profile lives outside the profile store: it is
+// disposable, holds no secrets, and should not ride along in backups/exports.
+function usageCacheRoot() {
+  if (process.env.CCSWITCH_CACHE_DIR) return path.join(process.env.CCSWITCH_CACHE_DIR, 'usage');
+  const base = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+  return path.join(base, 'ccswitch', 'usage');
+}
+
 export function config(target = defaultTarget()) {
   if (target === 'kimi') {
     const kimiHome =
@@ -59,6 +67,7 @@ export function config(target = defaultTarget()) {
       prog: progName() === 'kcswitch' ? 'kcswitch' : 'ccswitch kimi',
       toolName: 'Kimi Code',
       home: process.env.KCSWITCH_HOME || path.join(os.homedir(), '.kimi-profiles'),
+      usageCacheDir: path.join(usageCacheRoot(), 'kimi'),
       credentialsFile:
         process.env.KCSWITCH_CREDENTIALS_FILE || path.join(kimiHome, 'credentials', 'kimi-code.json'),
       kimiHome,
@@ -76,6 +85,7 @@ export function config(target = defaultTarget()) {
     prog: progName(),
     toolName: 'Claude Code',
     home: process.env.CCSWITCH_HOME || path.join(os.homedir(), '.claude-profiles'),
+    usageCacheDir: path.join(usageCacheRoot(), 'claude'),
     credentialsFile:
       process.env.CCSWITCH_CREDENTIALS_FILE || path.join(os.homedir(), '.claude', '.credentials.json'),
     keychainService: process.env.CCSWITCH_KEYCHAIN_SERVICE || 'Claude Code-credentials',
@@ -450,6 +460,7 @@ export function deleteProfileFile(name, cfg = config()) {
   if (!profileExists(name, cfg)) throw new UsageError(`no profile named "${name}"`);
   fs.rmSync(profilePath(name, cfg));
   fs.rmSync(path.join(cfg.home, 'dirs', name), { recursive: true, force: true });
+  fs.rmSync(path.join(cfg.usageCacheDir, `${name}.json`), { force: true });
 }
 
 function readState(cfg) {
@@ -1111,6 +1122,57 @@ const EXPIRY_MARGIN_MS = 5 * 60 * 1000;
 // distinct from transient network/server failures.
 export class AuthDeadError extends Error {}
 
+// A 429 from the usage endpoint says nothing about the account itself, so the
+// rows fall back to the last usage that did come through (see readUsageCache).
+export class RateLimitedError extends Error {}
+
+export function writeUsageCache(name, usage, cfg = config(), now = Date.now()) {
+  fs.mkdirSync(cfg.usageCacheDir, { recursive: true, mode: 0o700 });
+  const file = path.join(cfg.usageCacheDir, `${name}.json`);
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ fetchedAt: now, usage }), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+// Missing or unreadable cache is just "nothing known yet", never an error:
+// the caller already has a real failure to report.
+export function readUsageCache(name, cfg = config()) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(cfg.usageCacheDir, `${name}.json`), 'utf8'));
+    if (typeof rec?.fetchedAt !== 'number' || !rec.usage) return null;
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+export function formatAgo(ms, now = Date.now()) {
+  const mins = Math.max(0, Math.round((now - ms) / 60000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const h = Math.floor(mins / 60);
+  if (h < 24) return `${h}h${String(mins % 60).padStart(2, '0')}m ago`;
+  return `${Math.floor(h / 24)}d${String(h % 24).padStart(2, '0')}h ago`;
+}
+
+// Shared by both row builders: fetch, cache on success, fall back on 429.
+async function usageWithCache(name, cfg, fetchFn) {
+  try {
+    const usage = await fetchFn();
+    try {
+      writeUsageCache(name, usage, cfg);
+    } catch {
+      // An unwritable cache dir only costs the 429 fallback, not this row.
+    }
+    return { usage, stale: null };
+  } catch (err) {
+    if (!(err instanceof RateLimitedError)) throw err;
+    const cached = readUsageCache(name, cfg);
+    if (!cached) throw err;
+    return { usage: cached.usage, stale: `rate limited, cached ${formatAgo(cached.fetchedAt)}` };
+  }
+}
+
 export function tokenExpired(credentials, now = Date.now()) {
   try {
     const ms = expiryMs(JSON.parse(credentials));
@@ -1179,6 +1241,7 @@ export async function fetchUsage(credentials, fetchImpl = fetch) {
     headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
   });
   if (res.status === 401 || res.status === 403) throw new AuthDeadError(`token rejected (HTTP ${res.status})`);
+  if (res.status === 429) throw new RateLimitedError('usage request failed (HTTP 429)');
   if (!res.ok) throw new Error(`usage request failed (HTTP ${res.status})`);
   return parseUsage(await res.json());
 }
@@ -1306,6 +1369,7 @@ export async function fetchKimiUsage(credentials, fetchImpl = fetch, { baseUrl }
     headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
   });
   if (res.status === 401 || res.status === 403) throw new AuthDeadError(`token rejected (HTTP ${res.status})`);
+  if (res.status === 429) throw new RateLimitedError('usage request failed (HTTP 429)');
   if (!res.ok) throw new Error(`usage request failed (HTTP ${res.status})`);
   return parseKimiUsage(await res.json());
 }
@@ -1460,7 +1524,9 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
         if (isActive) writeCredentials(credentials, cfg);
         status = 'ok (refreshed)';
       }
-      usage = await fetchUsage(credentials, fetchImpl);
+      const got = await usageWithCache(p.name, cfg, () => fetchUsage(credentials, fetchImpl));
+      usage = got.usage;
+      if (got.stale) status = got.stale;
       succeeded++;
     } catch (err) {
       status = err instanceof AuthDeadError ? 'logged out' : `error: ${err.message}`;
@@ -1538,7 +1604,9 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
         status = 'ok (refreshed)';
       }
       const baseUrl = oauthAccount?.baseUrl ?? readKimiConnection(cfg).baseUrl;
-      usage = await fetchKimiUsage(credentials, fetchImpl, { baseUrl });
+      const got = await usageWithCache(p.name, cfg, () => fetchKimiUsage(credentials, fetchImpl, { baseUrl }));
+      usage = got.usage;
+      if (got.stale) status = got.stale;
       succeeded++;
       // Best-effort: cache the account's display fields into the profile so
       // list/usage show a nickname instead of a bare user id.

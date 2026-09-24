@@ -76,6 +76,8 @@ ccswitch run work -- -p "summarize this repo"
 
 `fable` is Fable's own weekly cap, reported separately from the general 7d window; it shows `-` on accounts that have no such cap. It queries Anthropic's OAuth usage endpoint with each profile's stored token. Expired access tokens are refreshed first, and the rotated token pair is written back to the profile *before* it's used — so a crash can never lose a login. Valid tokens are never refreshed (no pointless rotation), and a profile whose chain is dead just shows `logged out` without breaking the others.
 
+Each successful lookup is cached per profile in `~/.cache/ccswitch/usage/` (or `$XDG_CACHE_HOME/ccswitch/usage/`). If the usage endpoint answers `429`, that profile shows its last known numbers with a status like `rate limited, cached 12m ago` instead of an error. Reset countdowns stay accurate because they are stored as absolute times. Other failures never fall back to the cache, so stale numbers can't hide a real problem.
+
 ### Kimi Code accounts
 
 Prefix any command with `kimi` and it operates on Kimi Code logins instead, with the full feature set — switch, save, login, run, list, usage, delete, export/import, export-all/import-all, encrypt/decrypt:
@@ -157,6 +159,7 @@ Environment variables override the defaults (mainly useful for testing). The kim
 | `KCSWITCH_CREDENTIALS_FILE` | `$KCSWITCH_KIMI_HOME/credentials/kimi-code.json` |
 | `KCSWITCH_KIMI_HOME` | `$KIMI_CODE_HOME`, else `~/.kimi-code` |
 | `KCSWITCH_KIMI_BIN` | `kimi` |
+| `CCSWITCH_CACHE_DIR` | `$XDG_CACHE_HOME/ccswitch`, else `~/.cache/ccswitch` (usage cache, shared by both stores) |
 | `CCSWITCH_PASSPHRASE` / `KCSWITCH_PASSPHRASE` | (unset — either works for either store) |
 
 Region endpoints for kimi follow kimi's own resolution: `KIMI_CODE_BASE_URL` / `KIMI_CODE_OAUTH_HOST` (or `KIMI_OAUTH_HOST`), then the persisted login in `~/.kimi-code/config.toml`, then the mainland-cn defaults.

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -15,6 +15,7 @@ export function sandbox(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-test-'));
   process.env.CCSWITCH_HOME = path.join(home, 'profiles-home');
   process.env.CCSWITCH_CLAUDE_JSON = path.join(home, 'claude.json');
+  process.env.CCSWITCH_CACHE_DIR = path.join(home, 'cache');
   process.env.CCSWITCH_CREDENTIALS_FILE = path.join(home, 'credentials.json');
   process.env.CCSWITCH_KEYCHAIN_SERVICE =
     `ccswitch-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -1084,6 +1085,69 @@ test('usageCmd uses live credentials for the active profile without refreshing',
   captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
   assert.equal(urls.length, 1); // usage only, no token refresh
+});
+
+test('fetchUsage maps 429 to RateLimitedError', async () => {
+  await assert.rejects(fetchUsage(usageCreds(), async () => ({ ok: false, status: 429 })), RateLimitedError);
+});
+
+test('usageCmd caches usage and shows the last known value on 429', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  let status = 200;
+  const fetchImpl = async () =>
+    status === 200
+      ? { ok: true, status, json: async () => ({ five_hour: { utilization: 42, resets_at: null } }) }
+      : { ok: false, status, json: async () => ({}) };
+  process.env.NO_COLOR = '1';
+  t.after(() => delete process.env.NO_COLOR);
+  const lines = captureLog(t);
+
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  const cached = readUsageCache('work', cfg);
+  assert.equal(cached.usage.fiveHour.utilization, 42);
+  assert.equal(fs.statSync(path.join(cfg.usageCacheDir, 'work.json')).mode & 0o777, 0o600);
+
+  status = 429;
+  lines.length = 0;
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.match(lines.join('\n'), /42%/);
+  assert.match(lines.join('\n'), /rate limited, cached just now/);
+
+  // Other failures never fall back: stale numbers would hide a real problem.
+  status = 500;
+  lines.length = 0;
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
+  assert.match(lines.join('\n'), /error: usage request failed \(HTTP 500\)/);
+  assert.doesNotMatch(lines.join('\n'), /42%/);
+});
+
+test('usageCmd reports a 429 as an error when nothing is cached yet', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: {} }, cfg);
+  const lines = captureLog(t);
+  assert.equal(await usageCmd({}, cfg, async () => ({ ok: false, status: 429 })), 1);
+  assert.match(lines.join('\n'), /error: usage request failed \(HTTP 429\)/);
+});
+
+test('deleting a profile drops its cached usage', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: {} }, cfg);
+  fs.mkdirSync(cfg.usageCacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cfg.usageCacheDir, 'work.json'), '{}');
+  deleteProfileFile('work', cfg);
+  assert.equal(fs.existsSync(path.join(cfg.usageCacheDir, 'work.json')), false);
+});
+
+test('formatAgo renders coarse relative times', () => {
+  const now = 10 * 86400000;
+  assert.equal(formatAgo(now - 10000, now), 'just now');
+  assert.equal(formatAgo(now - 5 * 60000, now), '5m ago');
+  assert.equal(formatAgo(now - 125 * 60000, now), '2h05m ago');
+  assert.equal(formatAgo(now - 26 * 3600000, now), '1d02h ago');
 });
 
 test('usageCmd fails soft per profile and only exits 1 when all fail', async (t) => {

@@ -13,6 +13,7 @@ export function sandbox(t) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kcswitch-test-'));
   process.env.KCSWITCH_HOME = path.join(home, 'profiles-home');
   process.env.KCSWITCH_KIMI_HOME = path.join(home, 'kimi-home');
+  process.env.CCSWITCH_CACHE_DIR = path.join(home, 'cache');
   for (const v of ['KIMI_CODE_HOME', 'KIMI_CODE_BASE_URL', 'KIMI_CODE_OAUTH_HOST', 'KIMI_OAUTH_HOST']) {
     delete process.env[v];
   }
@@ -702,6 +703,31 @@ test('kimiUsageCmd fails soft per profile and only exits 1 when all fail', async
   lines.length = 0;
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
   assert.match(lines.join('\n'), /moved to another machine/);
+});
+
+test('kimiUsageCmd shows the last known usage on 429, in its own cache namespace', async (t) => {
+  sandbox(t);
+  const cfg = config('kimi');
+  saveProfile('work', { credentials: kimiCreds({ sub: 'u-1' }), oauthAccount: { userId: 'u-1', nickname: 'Shy' } }, cfg);
+  let status = 200;
+  const fetchImpl = async (url) => {
+    if (url.endsWith('/usages')) {
+      return status === 200
+        ? { ok: true, status, json: async () => ({ usage: { used: 3, limit: 10 } }) }
+        : { ok: false, status, json: async () => ({}) };
+    }
+    return { ok: false, status: 404 };
+  };
+  process.env.NO_COLOR = '1';
+  t.after(() => delete process.env.NO_COLOR);
+  const lines = captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.notEqual(cfg.usageCacheDir, config('claude').usageCacheDir);
+  status = 429;
+  lines.length = 0;
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.match(lines.join('\n'), /30%/);
+  assert.match(lines.join('\n'), /rate limited, cached just now/);
 });
 
 test('kimiUsageCmd --dry-run touches the network never', async (t) => {

@@ -341,3 +341,215 @@ test('kimi profiles sync through their own vault', async (t) => {
   await syncNow(B.cfg, { pgp: B.pgp });
   assert.equal(loadProfile('work', B.cfg).credentials, kc);
 });
+
+// --- commands and auto-sync hooks -------------------------------------------------
+
+import { syncSetup, syncStatus, withSyncLock } from '../ccswitch.mjs';
+
+// Routes sync traffic to the real in-process server and everything else to a
+// tiny fake provider, counting sync requests so debounce can be observed.
+function routedFetch(t, serverUrl, provider = async () => ({ ok: true, status: 200, json: async () => ({}) })) {
+  const real = globalThis.fetch;
+  const state = { syncCalls: 0 };
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith(serverUrl)) {
+      state.syncCalls++;
+      return real(url, init);
+    }
+    return provider(url, init);
+  };
+  t.after(() => { globalThis.fetch = real; });
+  return state;
+}
+
+test('main sync: pushes local profiles, reports, and a second run is a no-op', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  const lines = captureLog(t);
+  assert.equal(await main(['sync'], { pgp: A.pgp }), 0);
+  assert.match(lines.join('\n'), /pushed.*vault v1/);
+  assert.equal(await main(['sync'], { pgp: A.pgp }), 0);
+  assert.match(lines.join('\n'), /in sync.*v1/);
+});
+
+test('main: a command auto-pulls first and auto-pushes token changes afterwards', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  const B = machine(t, 'b', url);
+  B.use();
+  routedFetch(t, url);
+  captureLog(t);
+  captureErr(t);
+  assert.equal(await main(['usage'], { pgp: B.pgp }), 0); // pulled "work" before the usage table
+  assert.equal(loadProfile('work', B.cfg).credentials, creds('w'));
+
+  writeCredentials(creds('b-live'), B.cfg);
+  fs.writeFileSync(B.cfg.claudeJson, JSON.stringify({ oauthAccount: acct('u2') }));
+  writeSyncConfig({ lastSyncAt: new Date().toISOString() }, B.cfg); // fresh enough to skip the pre-pull
+  assert.equal(await main(['save', 'home'], { pgp: B.pgp }), 0); // pushed afterwards
+  A.use();
+  const ra = await syncNow(A.cfg, { pgp: A.pgp });
+  assert.deepEqual(ra.pulled, ['home']);
+  assert.equal(loadProfile('home', A.cfg).credentials, creds('b-live'));
+});
+
+test('main: the pre-command pull is debounced, list never syncs, and --dry-run never talks to the server', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  const state = routedFetch(t, url);
+  captureLog(t);
+  captureErr(t);
+  await main(['usage'], { pgp: A.pgp });
+  const after = state.syncCalls;
+  assert.ok(after >= 2, 'get + put');
+  await main(['usage'], { pgp: A.pgp });
+  assert.equal(state.syncCalls, after, 'second run inside the debounce window makes no sync request');
+  writeSyncConfig({ lastSyncAt: '2020-01-01T00:00:00.000Z' }, A.cfg);
+  await main(['list'], { pgp: A.pgp });
+  assert.equal(state.syncCalls, after, 'list is read-only and never syncs');
+  await main(['--dry-run', 'usage'], { pgp: A.pgp });
+  assert.equal(state.syncCalls, after, 'dry-run makes no requests');
+  await main(['usage'], { pgp: A.pgp });
+  assert.ok(state.syncCalls > after, 'past the window it syncs again');
+});
+
+test('main: sync failures warn and the command still succeeds', async (t) => {
+  const A = machine(t, 'a', 'http://127.0.0.1:1');
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  routedFetch(t, 'http://127.0.0.1:1');
+  const errs = captureErr(t);
+  const lines = captureLog(t);
+  assert.equal(await main(['usage'], { pgp: A.pgp }), 0);
+  assert.match(errs.join('\n'), /sync: could not reach .*continuing with local profiles/);
+  assert.match(lines.join('\n'), /work/);
+  assert.equal(await main(['sync'], { pgp: A.pgp }), 1);
+});
+
+test('withSyncLock skips when another ccswitch holds a fresh lock and breaks a stale one', async (t) => {
+  const A = machine(t, 'a', 'http://unused');
+  const lock = path.join(A.cfg.home, 'sync.lock');
+  fs.writeFileSync(lock, JSON.stringify({ pid: 1, at: new Date().toISOString() }));
+  assert.equal(await withSyncLock(A.cfg, async () => 'ran'), null);
+  fs.writeFileSync(lock, JSON.stringify({ pid: 1, at: '2020-01-01T00:00:00.000Z' }));
+  assert.equal(await withSyncLock(A.cfg, async () => 'ran'), 'ran');
+  assert.equal(fs.existsSync(lock), false);
+  await assert.rejects(withSyncLock(A.cfg, async () => { throw new Error('boom'); }), /boom/);
+  assert.equal(fs.existsSync(lock), false, 'lock released on failure');
+});
+
+test('main sync resolves pending candidate chains and pushes the winner', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile(
+    'work',
+    { credentials: creds('new'), oauthAccount: acct('u1'), savedAt: '2026-01-02T00:00:00.000Z', machine: 'a',
+      alternates: [{ credentials: creds('old'), savedAt: '2026-01-01T00:00:00.000Z', machine: 'b' }] },
+    A.cfg,
+  );
+  routedFetch(t, url, async (u, init) => {
+    if (u.includes('/oauth/usage')) {
+      const ok = init.headers.Authorization === 'Bearer at-old';
+      return { ok, status: ok ? 200 : 401, json: async () => ({}) };
+    }
+    return { ok: false, status: 400, json: async () => ({}) };
+  });
+  const errs = captureErr(t);
+  captureLog(t);
+  assert.equal(await main(['sync'], { pgp: A.pgp }), 0);
+  assert.equal(loadProfile('work', A.cfg).alternates, undefined);
+  assert.equal(loadProfile('work', A.cfg).credentials, creds('old'));
+  assert.match(errs.join('\n'), /chain from b is live/);
+  const B = machine(t, 'b', url);
+  await syncNow(B.cfg, { pgp: B.pgp });
+  assert.equal(loadProfile('work', B.cfg).credentials, creds('old'));
+  assert.equal(loadProfile('work', B.cfg).alternates, undefined);
+});
+
+test('sync status and sync off', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1'), alternates: [{ credentials: creds('x'), savedAt: '2026-01-01T00:00:00.000Z' }] }, A.cfg);
+  const lines = captureLog(t);
+  assert.equal(await main(['sync', 'status'], { pgp: A.pgp }), 0);
+  const out = lines.join('\n');
+  assert.match(out, new RegExp(url));
+  assert.match(out, /071BC24A/);
+  assert.match(out, /machine.*a/);
+  assert.match(out, /never/);
+  assert.match(out, /work/);
+  assert.equal(await main(['sync', 'off'], { pgp: A.pgp }), 0);
+  assert.equal(syncEnabled(A.cfg), false);
+  assert.equal(profileExists('work', A.cfg), true);
+  assert.equal(await main(['sync', 'status'], { pgp: A.pgp }), 0);
+  assert.match(lines.join('\n'), /not set up/);
+  await assert.rejects(main(['sync', 'bogus'], { pgp: A.pgp }), UsageError);
+});
+
+test('sync setup: picks a key, takes the URL, writes the config and runs the first sync', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url, { enabled: false });
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  const asked = [];
+  const picked = [];
+  const out = captureLog(t);
+  const gpg = {
+    findGpg: () => ({ bin: 'gpg', version: '2.5.0' }),
+    listSecretKeys: () => [
+      { fingerprint: 'DEAD'.repeat(10), uid: 'other <o@example.com>' },
+      { fingerprint: FPR, uid: 'me <me@example.com>' },
+    ],
+    generateKey: () => { throw new Error('not expected'); },
+    createPgp: ({ fingerprint }) => fakePgp(fingerprint),
+  };
+  const cfg = await syncSetup(A.cfg, {
+    gpg,
+    ask: async (q) => { asked.push(q); return q.includes('URL') ? url : ''; },
+    pick: async (header, rows) => { picked.push(rows); return 1; },
+  });
+  assert.equal(cfg.fingerprint, FPR);
+  assert.equal(cfg.server, url);
+  assert.match(cfg.machine, /^[a-z0-9.-]+-[0-9a-f]{4}$/i);
+  assert.deepEqual(picked[0].slice(0, 2).map((r) => r[0]), [`DEAD`.repeat(10).slice(-16), FPR.slice(-16)]);
+  assert.match(picked[0][2][1], /generate/i);
+  assert.equal(readSyncConfig(A.cfg).version, 1, 'first sync pushed the profile');
+  assert.match(out.join('\n'), /pushed/);
+});
+
+test('sync setup: can generate a key, and refuses without gpg', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url, { enabled: false });
+  const generated = [];
+  const gpg = {
+    findGpg: () => ({ bin: 'gpg', version: '2.5.0' }),
+    listSecretKeys: () => [],
+    generateKey: (uid) => { generated.push(uid); return FPR; },
+    createPgp: ({ fingerprint }) => fakePgp(fingerprint),
+  };
+  captureLog(t);
+  const cfg = await syncSetup(A.cfg, {
+    gpg,
+    ask: async (q) => (q.includes('URL') ? url : q.includes('name') ? 'Me <me@example.com>' : ''),
+    pick: async (header, rows) => rows.length - 1,
+  });
+  assert.deepEqual(generated, ['Me <me@example.com>']);
+  assert.equal(cfg.fingerprint, FPR);
+
+  const B = machine(t, 'b', url, { enabled: false });
+  const errs = [];
+  await assert.rejects(
+    syncSetup(B.cfg, { gpg: { ...gpg, findGpg: () => null, ensureGpg: async ({ out }) => { out('install it'); throw new UsageError('gpg is not installed'); } }, ask: async () => '', pick: async () => 0, out: (l) => errs.push(l) }),
+    /gpg is not installed/,
+  );
+});
+
+test('help lists the sync commands', async (t) => {
+  machine(t, 'a', 'http://unused', { enabled: false });
+  const lines = captureLog(t);
+  await main(['--help']);
+  const out = lines.join('\n');
+  for (const c of ['sync setup', 'sync status', 'sync off']) assert.ok(out.includes(c), c);
+});

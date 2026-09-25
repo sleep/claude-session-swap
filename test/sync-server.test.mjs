@@ -275,7 +275,7 @@ test('cli: ensureGpg explains how to install gpg when it is missing', async () =
   const env = { ...process.env, CCSWITCH_GPG_BIN: '/nonexistent/gpg-xyz', PATH: '/nonexistent' };
   await assert.rejects(
     ensureGpg({ rl: scriptedRl(['n']), out: (l) => out.push(l), env, platform: 'darwin' }),
-    (err) => err instanceof UsageError && /not installed/.test(err.message),
+    (err) => /not installed/.test(err.message),
   );
   assert.match(out.join('\n'), /brew install gnupg/);
 });

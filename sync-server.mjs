@@ -12,10 +12,11 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline/promises';
-import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-import { findGpg, installHint, verifyDetached } from './lib/gpg.mjs';
+import { GpgMissingError, ensureGpg, findGpg, installHint, verifyDetached } from './lib/gpg.mjs';
+
+export { ensureGpg };
 import { MAX_BODY_BYTES, MAX_VAULTS, ProtocolError, VAULT_NAMES, verifyEnvelope } from './lib/sync-protocol.mjs';
 
 const FPR_RE = /^[0-9A-F]{40}([0-9A-F]{24})?$/;
@@ -252,42 +253,16 @@ async function ask(rl, question, fallback) {
   return a || fallback;
 }
 
-// Which package manager is on the box decides whether we can offer to run
-// the install for the user or only tell them the command.
-function installCommand(platform = process.platform) {
-  const have = (bin) => spawnSync('sh', ['-c', `command -v ${bin}`], { encoding: 'utf8' }).status === 0;
-  if (platform === 'darwin' && have('brew')) return 'brew install gnupg';
-  if (platform === 'linux') {
-    if (have('apt-get')) return 'sudo apt-get install -y gnupg';
-    if (have('dnf')) return 'sudo dnf install -y gnupg2';
-    if (have('pacman')) return 'sudo pacman -S --noconfirm gnupg';
-  }
-  return null;
-}
-
-export async function ensureGpg({ rl, out = console.log, env = process.env, platform = process.platform } = {}) {
-  let found = findGpg({ env });
-  if (found) return found;
-  out('gpg (GnuPG 2.2 or newer) is required and was not found.');
-  out(installHint(platform));
-  const cmd = installCommand(platform);
-  if (cmd && rl) {
-    const answer = (await rl.question(`Run "${cmd}" now? [y/N] `)).trim().toLowerCase();
-    if (answer === 'y' || answer === 'yes') {
-      const r = spawnSync('sh', ['-c', cmd], { stdio: 'inherit' });
-      if (r.status !== 0) throw new UsageError(`"${cmd}" failed; install gpg and re-run setup`);
-      found = findGpg({ env });
-      if (found) return found;
-    }
-  }
-  throw new UsageError('gpg is not installed; install it and re-run setup');
-}
-
 export async function setup(dataDir, { rl, out = console.log } = {}) {
   const own = !rl;
   rl ??= readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    await ensureGpg({ rl, out });
+    try {
+      await ensureGpg({ rl, out });
+    } catch (err) {
+      if (err instanceof GpgMissingError) throw new UsageError(err.message);
+      throw err;
+    }
     const existing = readServerConfig(dataDir);
     if (existing) {
       const again = (await rl.question(`${dataDir} is already set up. Reconfigure (keeps vaults and URL)? [y/N] `)).trim().toLowerCase();
@@ -390,7 +365,7 @@ if (invokedDirectly) {
   main().then(
     (code) => process.exit(code),
     (err) => {
-      console.error(`ccswitch-server: ${err instanceof UsageError ? err.message : (err.stack ?? err.message)}`);
+      console.error(`ccswitch-server: ${err instanceof UsageError || err instanceof GpgMissingError ? err.message : (err.stack ?? err.message)}`);
       process.exit(1);
     },
   );

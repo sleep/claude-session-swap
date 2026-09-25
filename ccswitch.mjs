@@ -20,7 +20,7 @@ import { emitKeypressEvents } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
 import { GpgError, createPgp, ensureGpg, findGpg, generateKey, listSecretKeys } from './lib/gpg.mjs';
-import { buildEnvelope, canonicalJson, digestMap, mergeVaults } from './lib/sync-protocol.mjs';
+import { buildEnvelope, digestMap, entryDigest, mergeVaults } from './lib/sync-protocol.mjs';
 
 export class UsageError extends Error {}
 
@@ -1081,7 +1081,15 @@ export function syncEnabled(cfg = config()) {
 export function recordTombstone(name, cfg = config()) {
   if (!syncEnabled(cfg)) return;
   const sc = readSyncConfig(cfg);
-  writeSyncConfig({ tombstones: { ...(sc.tombstones ?? {}), [name]: new Date().toISOString() } }, cfg);
+  const tombstone = { deletedAt: new Date().toISOString(), ...(sc.machine ? { machine: sc.machine } : {}) };
+  writeSyncConfig({ tombstones: { ...(sc.tombstones ?? {}), [name]: tombstone } }, cfg);
+}
+
+// Tombstones are kept exactly as they travel in the vault: rebuilding one
+// with a different machine label would look like a change to every merge and
+// keep two machines pushing the vault back and forth forever.
+function storedTombstone(t) {
+  return typeof t === 'string' ? { deletedAt: t } : t;
 }
 
 export function buildLocalVault(cfg = config()) {
@@ -1112,13 +1120,13 @@ export function buildLocalVault(cfg = config()) {
     if (p.alternates?.length) entry.alternates = p.alternates;
     profiles[p.name] = entry;
   }
-  for (const [name, deletedAt] of Object.entries(sc.tombstones ?? {})) {
-    if (!profiles[name]) profiles[name] = { deletedAt, ...(sc.machine ? { machine: sc.machine } : {}) };
+  for (const [name, t] of Object.entries(sc.tombstones ?? {})) {
+    if (!profiles[name]) profiles[name] = storedTombstone(t);
   }
   return profiles;
 }
 
-export function applyMerge(merged, { write, delete: del }, cfg = config()) {
+export function applyMerge(merged, { write, delete: del }, cfg = config(), { liveWas } = {}) {
   if (write.length === 0 && del.length === 0) return;
   writeBackup('sync-pull', Object.fromEntries([...write, ...del].map((n) => [n, quietLoadProfile(n, cfg)])), cfg);
   const active = getActive(cfg);
@@ -1131,18 +1139,30 @@ export function applyMerge(merged, { write, delete: del }, cfg = config()) {
       cfg,
     );
     delete tombstones[name];
-    if (name === active && e.credentials && readCredentials(cfg) !== e.credentials) {
-      writeCredentials(e.credentials, cfg);
-      updateOauthAccount(e.oauthAccount ?? null, cfg);
-      warnIfToolRunning(cfg);
+    if (name !== active || !e.credentials) continue;
+    const liveNow = readCredentials(cfg);
+    if (liveNow === e.credentials) continue;
+    if (liveWas !== undefined && liveNow && liveNow !== liveWas) {
+      // The tool rotated the live chain while the sync was in flight. That
+      // chain is newer than anything the vault knows, so it stays live and
+      // rides along as a candidate for the next probe instead of being
+      // overwritten by the pulled copy.
+      const rotated = { credentials: liveNow, savedAt: new Date().toISOString(), machine: localMachine(cfg) ?? undefined };
+      const alternates = [rotated, ...(e.alternates ?? [])].filter((a, i, all) => all.findIndex((b) => b.credentials === a.credentials) === i);
+      saveProfile(name, { credentials: e.credentials, oauthAccount: e.oauthAccount ?? null, savedAt: e.savedAt ?? undefined, machine: e.machine, alternates }, cfg);
+      console.error(`"${name}": the live login was rotated while syncing; keeping both chains to test on the next use`);
+      continue;
     }
+    writeCredentials(e.credentials, cfg);
+    updateOauthAccount(e.oauthAccount ?? null, cfg);
+    warnIfToolRunning(cfg);
   }
   for (const name of del) {
     if (profileExists(name, cfg)) deleteProfileFile(name, cfg);
     // The live login stays; only the pointer goes, so the next switch cannot
     // save the live chain back under a name that no longer exists.
     if (name === active) setActive(null, cfg);
-    tombstones[name] = merged[name].deletedAt;
+    tombstones[name] = merged[name];
   }
   writeSyncConfig({ tombstones }, cfg);
 }
@@ -1173,8 +1193,11 @@ async function syncRequest(op, { baseVersion, data }, cfg, { pgp, fetchImpl, now
   } catch {}
   if (res.status === 404) throw new SyncError('server answered 404: wrong sync URL (the secret path must match the server)');
   if (res.status === 401) throw new SyncError(`server rejected the signature (${json?.error ?? 'no detail'})`);
-  if (res.status === 409) return { status: 409, version: json.version, data: json.data };
-  if (!res.ok) throw new SyncError(`server error HTTP ${res.status}: ${json?.error ?? text.slice(0, 200)}`);
+  if (!res.ok && res.status !== 409) throw new SyncError(`server error HTTP ${res.status}: ${json?.error ?? text.slice(0, 200)}`);
+  if (!json || typeof json !== 'object' || !Number.isSafeInteger(json.version) || json.version < 0) {
+    throw new SyncError(`server answered HTTP ${res.status} with an unusable body`);
+  }
+  if (res.status === 409) return { status: 409, version: json.version, data: json.data ?? null };
   return { status: 200, ...json };
 }
 
@@ -1209,8 +1232,14 @@ function sealVault(profiles, version, cfg, pgp) {
 }
 
 export function localSyncPending(cfg = config()) {
-  const sc = readSyncConfig(cfg);
-  return canonicalJson(digestMap(buildLocalVault(cfg))) !== canonicalJson(sc?.base ?? {});
+  const base = readSyncConfig(cfg)?.base ?? {};
+  const local = buildLocalVault(cfg);
+  for (const name of new Set([...Object.keys(local), ...Object.keys(base)])) {
+    const e = local[name];
+    if (e && typeof e.movedAt === 'string') continue; // a moved marker never travels, so it never differs
+    if (!e || entryDigest(e) !== base[name]) return true;
+  }
+  return false;
 }
 
 export async function syncNow(cfg = config(), { pgp = null, fetchImpl = fetch, now = Date.now } = {}) {
@@ -1220,30 +1249,45 @@ export async function syncNow(cfg = config(), { pgp = null, fetchImpl = fetch, n
   const deps = { pgp, fetchImpl, now };
   const summary = { pulled: [], deleted: [], pushed: false, version: sc.version ?? 0 };
   let local = buildLocalVault(cfg);
-  const got = await syncRequest('get', { baseVersion: 0 }, cfg, deps);
+  const liveWas = readCredentials(cfg);
   const known = sc.version ?? 0;
-  if (got.version < known || (got.data === null && known > 0)) {
-    throw new SyncError(`server returned an older vault (version ${got.version}, last seen ${known}); refusing to roll back`);
-  }
+  // Every reply that carries a vault is held to the same floor: a server
+  // that can roll a client back through a 409 is no better than one that
+  // rolls it back through a get.
+  const notOlder = (reply) => {
+    if (reply.version < known || (reply.data === null && known > 0)) {
+      throw new SyncError(`server returned an older vault (version ${reply.version}, last seen ${known}); refusing to roll back`);
+    }
+  };
+  const got = await syncRequest('get', { baseVersion: 0 }, cfg, deps);
+  notOlder(got);
   let version = got.version;
   let remote = got.data === null ? {} : openVault(got.data, version, cfg, pgp);
+  let base = sc.base ?? null;
   const finish = (v, merged) => {
     writeSyncConfig({ version: v, lastSyncAt: new Date(now()).toISOString(), base: digestMap(merged) }, cfg);
     summary.version = v;
     return summary;
   };
   for (let attempt = 0; ; attempt++) {
-    const { merged, localChanges, remoteStale } = mergeVaults(local, remote, sc.base ?? null);
-    applyMerge(merged, localChanges, cfg);
+    const { merged, localChanges, remoteStale } = mergeVaults(local, remote, base);
+    applyMerge(merged, localChanges, cfg, { liveWas });
     summary.pulled.push(...localChanges.write);
     summary.deleted.push(...localChanges.delete);
     if (!remoteStale) return finish(version, merged);
     const put = await syncRequest('put', { baseVersion: version, data: sealVault(merged, version + 1, cfg, pgp) }, cfg, deps);
     if (put.status === 200) {
+      if (put.version !== version + 1) throw new SyncError(`server stored the vault as version ${put.version} instead of ${version + 1}; refusing it`);
       summary.pushed = true;
       return finish(put.version, merged);
     }
+    if (put.version <= version) throw new SyncError(`server answered a conflict with version ${put.version}, not newer than ${version}; refusing to roll back`);
+    notOlder(put);
     if (attempt >= 2) throw new SyncError('the vault kept changing on the server; try again');
+    // What was just merged descends from the vault just seen, so that vault
+    // is the base for the retry; the old base would make every entry the
+    // server moved on look like a two-sided conflict.
+    base = digestMap(remote);
     version = put.version;
     remote = put.data === null ? {} : openVault(put.data, version, cfg, pgp);
     local = merged;
@@ -1937,9 +1981,17 @@ async function probeChain(credentials, oauthAccount, cfg, fetchImpl) {
 export async function resolveAlternates(name, profile, cfg = config(), fetchImpl = fetch) {
   const alternates = Array.isArray(profile.alternates) ? profile.alternates : [];
   if (alternates.length === 0) return { profile, resolved: false, live: null };
-  const candidates = [{ credentials: profile.credentials, savedAt: profile.savedAt, machine: profile.machine }, ...alternates]
-    .filter((c) => typeof c.credentials === 'string')
-    .sort((a, b) => (Date.parse(b.savedAt) || 0) - (Date.parse(a.savedAt) || 0));
+  const candidates = [{ credentials: profile.credentials, savedAt: profile.savedAt, machine: profile.machine }, ...alternates];
+  if (getActive(cfg) === name) {
+    // The tool may have rotated the live chain since the profile was
+    // written; that chain is the newest of all and must be tried first.
+    const live = captureLive(cfg);
+    if (live.credentials && live.credentials !== profile.credentials && sameAccount(live.oauthAccount, profile.oauthAccount)) {
+      candidates.unshift({ credentials: live.credentials, savedAt: new Date().toISOString(), machine: localMachine(cfg) ?? 'this machine' });
+    }
+  }
+  candidates.sort((a, b) => (Date.parse(b.savedAt) || 0) - (Date.parse(a.savedAt) || 0));
+  for (let i = candidates.length - 1; i >= 0; i--) if (typeof candidates[i].credentials !== 'string') candidates.splice(i, 1);
   const label = (c) => c.machine ?? 'an unknown machine';
   let winner = null;
   try {
@@ -2039,18 +2091,28 @@ async function autoSync(cfg, deps) {
     if (r === null) console.error('sync: another ccswitch is syncing; skipped');
     return true;
   } catch (err) {
+    // Remembered so a dead server costs one attempt per window, not a
+    // timeout on every command.
+    writeSyncConfig({ lastAttemptAt: new Date().toISOString() }, cfg);
     console.error(`sync: ${err.message}; continuing with local profiles`);
     return false;
   }
 }
 
+function syncedRecently(cfg) {
+  const sc = readSyncConfig(cfg) ?? {};
+  const last = Math.max(Date.parse(sc.lastSyncAt ?? '') || 0, Date.parse(sc.lastAttemptAt ?? '') || 0);
+  return Date.now() - last < SYNC_DEBOUNCE_MS;
+}
+
 async function syncBefore(cfg, deps) {
-  const last = Date.parse(readSyncConfig(cfg)?.lastSyncAt ?? '') || 0;
-  if (Date.now() - last < SYNC_DEBOUNCE_MS) return true;
+  if (syncedRecently(cfg)) return true;
   return autoSync(cfg, deps);
 }
 
 async function syncAfter(cfg, deps) {
+  const sc = readSyncConfig(cfg) ?? {};
+  if (Date.now() - (Date.parse(sc.lastAttemptAt ?? '') || 0) < SYNC_DEBOUNCE_MS) return; // still backing off
   let pending;
   try {
     pending = localSyncPending(cfg);
@@ -2176,7 +2238,16 @@ async function syncSetupWith(cfg, deps, { g, ask, pick, out }) {
   return readSyncConfig(cfg);
 }
 
-async function syncCmd(sub, cfg, deps) {
+async function syncCmd(sub, cfg, deps, dryRun = false) {
+  if (dryRun && sub !== 'status') {
+    const sc = readSyncConfig(cfg);
+    const what =
+      sub === 'setup' ? 'ask for a gpg key and server URL, then run a first sync'
+      : sub === 'off' ? 'remove sync.json (profiles and the server vault stay)'
+      : `sync ${cfg.target} profiles with ${sc?.server ?? '(no server configured)'}`;
+    console.log(`[dry-run] would ${what}`);
+    return 0;
+  }
   if (sub === 'setup') {
     await syncSetup(cfg, deps);
     return 0;
@@ -2418,7 +2489,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     await requirePassphrase();
   }
   const syncDeps = { pgp: deps.pgp ?? null, fetchImpl: deps.fetchImpl ?? fetch };
-  if (cmd === 'sync') return syncCmd(rest[0], cfg, syncDeps);
+  if (cmd === 'sync') return syncCmd(rest[0], cfg, syncDeps, dryRun);
   // Every other command runs between a pull (so it sees the newest chains)
   // and a push (so what it changed reaches the other machines). Neither can
   // fail the command itself. Dry runs never touch the network.

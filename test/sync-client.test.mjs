@@ -108,7 +108,7 @@ test('buildLocalVault mirrors profiles, marks moved ones, and adds recorded tomb
   const vault = buildLocalVault(cfg);
   assert.deepEqual(vault.work, { credentials: creds('w'), oauthAccount: acct('u1'), savedAt: '2026-01-01T00:00:00.000Z', machine: 'a' });
   assert.deepEqual(vault.gone, { movedAt: '2026-01-02T00:00:00.000Z' });
-  assert.deepEqual(vault.old, { deletedAt: '2026-01-03T00:00:00.000Z', machine: 'a' });
+  assert.deepEqual(vault.old, { deletedAt: '2026-01-03T00:00:00.000Z' }); // legacy string form, travels as recorded
 });
 
 test('buildLocalVault takes the live chain for the active profile and saves it back', (t) => {
@@ -154,7 +154,7 @@ test('applyMerge writes, deletes, revives moved profiles, updates the live login
   assert.equal(profileExists('bye', cfg), false);
   assert.equal(loadProfile('moved', cfg).movedAt, undefined);
   assert.equal(loadProfile('fresh', cfg).alternates.length, 1);
-  assert.deepEqual(readSyncConfig(cfg).tombstones, { bye: '2026-02-01T00:00:00.000Z' });
+  assert.deepEqual(readSyncConfig(cfg).tombstones, { bye: { deletedAt: '2026-02-01T00:00:00.000Z' } });
   assert.ok(fs.readdirSync(path.join(cfg.home, 'backups')).some((f) => f.includes('sync-pull')));
 
   applyMerge({ work: { deletedAt: '2026-03-01T00:00:00.000Z' } }, { write: [], delete: ['work'] }, cfg);
@@ -226,7 +226,7 @@ test('a delete on B removes the profile on A', async (t) => {
   B.use();
   captureLog(t);
   await deleteProfileCmd('work', { force: true }, B.cfg);
-  assert.equal(typeof readSyncConfig(B.cfg).tombstones.work, 'string');
+  assert.equal(typeof readSyncConfig(B.cfg).tombstones.work.deletedAt, 'string');
   await syncNow(B.cfg, { pgp: B.pgp });
   A.use();
   const ra = await syncNow(A.cfg, { pgp: A.pgp });
@@ -605,4 +605,176 @@ test('ccswitch sync setup works end to end with piped answers and a real key', {
   assert.equal(loadProfile('work', B.cfg).credentials, creds('w'));
   const status = await run(['sync', 'status'], '');
   assert.match(status.stdout, /vault:\s+claude v1/);
+});
+
+// --- review fix pass -----------------------------------------------------------------
+
+import { localSyncPending } from '../ccswitch.mjs';
+
+// Wraps real fetch so a test can tamper with what the server answers.
+// `fake(payload)` answers without touching the server; `mutate(payload,
+// status, body)` rewrites a real reply.
+function tamperingFetch({ fake = () => null, mutate = () => null } = {}) {
+  const reply = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+  return async (u, init) => {
+    const payload = JSON.parse(JSON.parse(init.body).payload);
+    const faked = fake(payload);
+    if (faked) return reply(faked.status, faked.body);
+    const res = await fetch(u, init);
+    const text = await res.text();
+    const out = mutate(payload, res.status, text ? JSON.parse(text) : null);
+    return out ? reply(out.status, out.body) : new Response(text, { status: res.status, headers: { 'content-type': 'application/json' } });
+  };
+}
+
+test('fix: a 409 carrying an older vault, or a 200 with a wrong version, is refused', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('v1'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  let v1blob;
+  const capture = tamperingFetch({ mutate: (payload, status, body) => {
+    if (payload.op === 'get') v1blob = body;
+    return null;
+  } });
+  await syncNow(A.cfg, { pgp: A.pgp, fetchImpl: capture });
+  saveProfile('work', { credentials: creds('v2'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  assert.equal(readSyncConfig(A.cfg).version, 2);
+
+  saveProfile('work', { credentials: creds('v3'), oauthAccount: acct('u1') }, A.cfg);
+  const rollback = tamperingFetch({ fake: (payload) => (payload.op === 'put' ? { status: 409, body: { error: 'version conflict', ...v1blob } } : null) });
+  await assert.rejects(syncNow(A.cfg, { pgp: A.pgp, fetchImpl: rollback }), (err) => err instanceof SyncError && /roll back/.test(err.message));
+  assert.equal(loadProfile('work', A.cfg).credentials, creds('v3'), 'local chain untouched');
+  assert.equal(loadProfile('work', A.cfg).alternates, undefined);
+
+  const reset = tamperingFetch({ fake: (payload) => (payload.op === 'put' ? { status: 200, body: { version: 0 } } : null) });
+  await assert.rejects(syncNow(A.cfg, { pgp: A.pgp, fetchImpl: reset }), (err) => err instanceof SyncError && /version/.test(err.message));
+  assert.equal(readSyncConfig(A.cfg).version, 2, 'rollback floor kept');
+
+  const garbage = tamperingFetch({ mutate: (payload, status, body) => (status === 200 && payload.op === 'get' ? { status: 200, body: { ...body, version: 'two' } } : null) });
+  await assert.rejects(syncNow(A.cfg, { pgp: A.pgp, fetchImpl: garbage }), SyncError);
+});
+
+test('fix: a moved profile does not keep every command syncing', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1'), movedAt: new Date().toISOString() }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  assert.equal(localSyncPending(A.cfg), false);
+  const r = await syncNow(A.cfg, { pgp: A.pgp });
+  assert.equal(r.pushed, false);
+});
+
+test('fix: a delete settles instead of ping-ponging between machines', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  const B = machine(t, 'b', url);
+  await syncNow(B.cfg, { pgp: B.pgp });
+  B.use();
+  captureLog(t);
+  await deleteProfileCmd('work', { force: true }, B.cfg);
+  await syncNow(B.cfg, { pgp: B.pgp });
+  A.use();
+  await syncNow(A.cfg, { pgp: A.pgp });
+  const pushes = [];
+  for (let i = 0; i < 4; i++) {
+    B.use();
+    pushes.push((await syncNow(B.cfg, { pgp: B.pgp })).pushed);
+    A.use();
+    pushes.push((await syncNow(A.cfg, { pgp: A.pgp })).pushed);
+  }
+  assert.deepEqual(pushes, [false, false, false, false, false, false, false, false]);
+  assert.equal(localSyncPending(A.cfg), false);
+});
+
+test('fix: a 409 retry merges against the vault it just saw, not the old base', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('v0'), oauthAccount: acct('u1'), savedAt: '2026-01-01T00:00:00.000Z' }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  const B = machine(t, 'b', url);
+  await syncNow(B.cfg, { pgp: B.pgp });
+  B.use();
+  saveProfile('work', { credentials: creds('v1'), oauthAccount: acct('u1'), savedAt: '2026-01-02T00:00:00.000Z', machine: 'b' }, B.cfg);
+  await syncNow(B.cfg, { pgp: B.pgp });
+  // A adds a profile (so it must push) while B moves "work" on again between A's get and put.
+  A.use();
+  saveProfile('extra', { credentials: creds('x'), oauthAccount: acct('u2') }, A.cfg);
+  let raced = false;
+  const racing = async (u, init) => {
+    if (!raced && JSON.parse(JSON.parse(init.body).payload).op === 'put') {
+      raced = true;
+      B.use();
+      saveProfile('work', { credentials: creds('v2'), oauthAccount: acct('u1'), savedAt: '2026-01-03T00:00:00.000Z', machine: 'b' }, B.cfg);
+      await syncNow(B.cfg, { pgp: B.pgp });
+      A.use();
+    }
+    return fetch(u, init);
+  };
+  const r = await syncNow(A.cfg, { pgp: A.pgp, fetchImpl: racing });
+  assert.equal(r.pushed, true);
+  const work = loadProfile('work', A.cfg);
+  assert.equal(work.credentials, creds('v2'));
+  assert.equal(work.alternates, undefined, 'a chain A never changed must not become a conflict');
+});
+
+test('fix: a live chain rotated during the sync round trip is kept as a candidate, not overwritten', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('v1'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  const B = machine(t, 'b', url);
+  await syncNow(B.cfg, { pgp: B.pgp });
+  B.use();
+  setActive('work', B.cfg);
+  writeCredentials(creds('v1'), B.cfg);
+  fs.writeFileSync(B.cfg.claudeJson, JSON.stringify({ oauthAccount: acct('u1') }));
+  A.use();
+  saveProfile('work', { credentials: creds('v2'), oauthAccount: acct('u1') }, A.cfg);
+  await syncNow(A.cfg, { pgp: A.pgp });
+  B.use();
+  const rotating = async (u, init) => {
+    writeCredentials(creds('rotated-by-claude'), B.cfg); // claude refreshes while the request is in flight
+    return fetch(u, init);
+  };
+  const errs = captureErr(t);
+  await syncNow(B.cfg, { pgp: B.pgp, fetchImpl: rotating });
+  assert.equal(readCredentials(B.cfg), creds('rotated-by-claude'), 'live file not clobbered');
+  const work = loadProfile('work', B.cfg);
+  assert.equal(work.credentials, creds('v2'));
+  assert.deepEqual(work.alternates.map((a) => a.credentials), [creds('rotated-by-claude')]);
+  assert.match(errs.join('\n'), /rotated/);
+});
+
+test('fix: sync failures back off instead of costing every command a timeout', async (t) => {
+  const A = machine(t, 'a', 'http://127.0.0.1:1');
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  const state = routedFetch(t, 'http://127.0.0.1:1');
+  captureLog(t);
+  const errs = captureErr(t);
+  await main(['usage'], { pgp: A.pgp });
+  const after = state.syncCalls;
+  assert.ok(after >= 1);
+  await main(['usage'], { pgp: A.pgp });
+  assert.equal(state.syncCalls, after, 'no retry inside the backoff window');
+  assert.equal(errs.filter((l) => l.startsWith('sync:')).length, 1);
+});
+
+test('fix: sync commands honour --dry-run', async (t) => {
+  const { url } = await server(t);
+  const A = machine(t, 'a', url);
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  const state = routedFetch(t, url);
+  const lines = captureLog(t);
+  assert.equal(await main(['--dry-run', 'sync'], { pgp: A.pgp }), 0);
+  assert.equal(await main(['--dry-run', 'sync', 'off'], { pgp: A.pgp }), 0);
+  assert.equal(await main(['--dry-run', 'sync', 'setup'], { pgp: A.pgp }), 0);
+  assert.equal(state.syncCalls, 0);
+  assert.equal(syncEnabled(A.cfg), true);
+  assert.equal(lines.filter((l) => l.startsWith('[dry-run]')).length, 3);
 });

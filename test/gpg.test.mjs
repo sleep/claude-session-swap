@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  BASE_ARGS,
   GpgError,
   createPgp,
   findGpg,
@@ -161,4 +162,14 @@ test('decrypt rejects garbage', { skip }, (t) => {
   const env = keyring(t);
   const fpr = generateKey('alice <alice@example.invalid>', { env, passphrase: '' });
   assert.throws(() => createPgp({ fingerprint: fpr, env }).decrypt('-----BEGIN PGP MESSAGE-----\nnope\n-----END PGP MESSAGE-----\n'), GpgError);
+});
+
+test('client calls never auto-fetch keys and fail fast instead of prompting when not interactive', { skip }, (t) => {
+  const env = keyring(t);
+  const fpr = generateKey('alice <alice@example.invalid>', { env, passphrase: 'secret' });
+  const pgp = createPgp({ fingerprint: fpr, env, interactive: false });
+  const started = Date.now();
+  assert.throws(() => pgp.sign('x'), GpgError);
+  assert.ok(Date.now() - started < 5000, 'no pinentry wait');
+  assert.ok(BASE_ARGS.includes('--no-auto-key-retrieve') && BASE_ARGS.includes('--no-auto-key-locate'));
 });

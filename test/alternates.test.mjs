@@ -267,3 +267,18 @@ test('main switches to the chain that survives probing', async (t) => {
   assert.equal(getActive(cfg), 'work');
   assert.equal(readCredentials(cfg), creds('old'));
 });
+
+test('resolveAlternates probes the live chain first when the active profile was rotated by the tool', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  const profile = conflicted(cfg);
+  setActive('work', cfg);
+  writeCredentials(creds('live'), cfg);
+  fs.writeFileSync(cfg.claudeJson, JSON.stringify({ oauthAccount: { emailAddress: 'w@example.com', accountUuid: 'u1' } }));
+  const net = fakeNet({ usage: { 'at-live': 200, 'at-new': 200 } });
+  captureErr(t);
+  const r = await resolveAlternates('work', profile, cfg, net.fetchImpl);
+  assert.deepEqual(net.calls, [['usage', 'at-live']]);
+  assert.equal(r.profile.credentials, creds('live'));
+  assert.equal(readCredentials(cfg), creds('live'));
+});

@@ -15,10 +15,10 @@ Requires Node.js ≥ 20. Credentials are managed through the `~/.claude/.credent
 ```sh
 git clone <this repo>
 cd claude-session-swap
-npm link        # puts `ccswitch` and `kcswitch` on your PATH
+npm link        # puts `ccswitch`, `kcswitch` and `ccswitch-server` on your PATH
 ```
 
-No dependencies to install — the tool is a single zero-dependency script by design, since it handles OAuth refresh tokens and every third-party package would be supply-chain attack surface.
+No dependencies to install: the tool is zero-dependency by design (`ccswitch.mjs` plus two small modules under `lib/`), since it handles OAuth refresh tokens and every third-party package would be supply-chain attack surface.
 
 ## Usage
 

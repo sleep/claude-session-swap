@@ -399,7 +399,7 @@ function quietLoadProfile(name, cfg) {
   }
 }
 
-export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt }, cfg = config()) {
+export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt, machine, alternates }, cfg = config()) {
   validateName(name);
   ensureHome(cfg);
   // Kimi display fields (nickname, email, level) arrive via best-effort /me
@@ -413,8 +413,17 @@ export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt 
       };
     }
   }
+  // machine and alternates come from sync: which machine last saved this
+  // chain, and rival chains from a double refresh awaiting a probe.
   const body = JSON.stringify(
-    { credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString(), ...(movedAt ? { movedAt } : {}) },
+    {
+      credentials,
+      oauthAccount,
+      savedAt: savedAt ?? new Date().toISOString(),
+      ...(movedAt ? { movedAt } : {}),
+      ...(machine ? { machine } : {}),
+      ...(Array.isArray(alternates) && alternates.length > 0 ? { alternates } : {}),
+    },
     null,
     2,
   );
@@ -489,6 +498,28 @@ export function setActive(name, cfg = config()) {
 
 export function storeEncrypted(cfg = config()) {
   return readState(cfg).encrypted === true;
+}
+
+// Sync settings live beside state.json: server URL, signing key, this
+// machine's label, and the bookkeeping the three-way merge needs.
+export function readSyncConfig(cfg = config()) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(cfg.home, 'sync.json'), 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+export function writeSyncConfig(patch, cfg = config()) {
+  ensureHome(cfg);
+  const next = { ...(readSyncConfig(cfg) ?? {}), ...patch };
+  fs.writeFileSync(path.join(cfg.home, 'sync.json'), JSON.stringify(next, null, 2), { mode: 0o600 });
+  return next;
+}
+
+export function localMachine(cfg = config()) {
+  return readSyncConfig(cfg)?.machine ?? null;
 }
 
 export function writeBackup(reason, payload, cfg = config()) {
@@ -1500,8 +1531,11 @@ const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets
 async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
   const rows = [];
   let succeeded = 0;
-  for (const p of profiles) {
+  for (let p of profiles) {
     const isActive = p.name === active;
+    if (p.alternates?.length && !p.movedAt) {
+      p = { name: p.name, ...(await resolveAlternates(p.name, p, cfg, fetchImpl)).profile };
+    }
     if (p.movedAt) {
       // The chain rotates on another machine now; refreshing it from here
       // would revoke it there.
@@ -1577,8 +1611,11 @@ const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', '
 async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
   const rows = [];
   let succeeded = 0;
-  for (const p of profiles) {
+  for (let p of profiles) {
     const isActive = p.name === active;
+    if (p.alternates?.length && !p.movedAt) {
+      p = { name: p.name, ...(await resolveAlternates(p.name, p, cfg, fetchImpl)).profile };
+    }
     let account = displayAccount(p.oauthAccount) ?? '-';
     if (p.movedAt) {
       // The chain rotates on another machine now; refreshing it from here
@@ -1664,6 +1701,92 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
   const { header, rows, succeeded } = await kimiUsageRows(profiles, active, cfg, fetchImpl, shouldUseColor());
   console.log(renderTable(header, rows, terminalWidth()));
   return succeeded > 0 ? 0 : 1;
+}
+
+// --- Candidate chains -------------------------------------------------------------
+// Two machines that both refreshed the same profile between syncs each hold a
+// chain the other does not know about. Sync keeps both (see mergeVaults) and
+// the next use asks the provider which one still works. Probing goes newest
+// first and stops at the first live chain: refreshing a superseded token after
+// a newer one already worked is what trips reuse detection and revokes the
+// whole family, so the older candidates are only ever touched once the newer
+// ones are known to be dead.
+
+async function probeChain(credentials, oauthAccount, cfg, fetchImpl) {
+  const kimi = cfg.target === 'kimi';
+  const conn = kimi ? readKimiConnection(cfg) : null;
+  if (!tokenExpired(credentials)) {
+    try {
+      if (kimi) await fetchKimiUsage(credentials, fetchImpl, { baseUrl: oauthAccount?.baseUrl ?? conn.baseUrl });
+      else await fetchUsage(credentials, fetchImpl);
+      return { live: true, credentials };
+    } catch (err) {
+      // 429 means the token was accepted and only the quota endpoint balked.
+      if (err instanceof RateLimitedError) return { live: true, credentials };
+      if (!(err instanceof AuthDeadError)) throw err;
+    }
+  }
+  try {
+    const fresh = kimi
+      ? await refreshKimiCredentials(credentials, fetchImpl, { oauthHost: oauthAccount?.oauthHost ?? conn.oauthHost })
+      : await refreshCredentials(credentials, fetchImpl);
+    return { live: true, credentials: fresh };
+  } catch (err) {
+    if (err instanceof AuthDeadError) return { live: false };
+    throw err;
+  }
+}
+
+export async function resolveAlternates(name, profile, cfg = config(), fetchImpl = fetch) {
+  const alternates = Array.isArray(profile.alternates) ? profile.alternates : [];
+  if (alternates.length === 0) return { profile, resolved: false, live: null };
+  const candidates = [{ credentials: profile.credentials, savedAt: profile.savedAt, machine: profile.machine }, ...alternates]
+    .filter((c) => typeof c.credentials === 'string')
+    .sort((a, b) => (Date.parse(b.savedAt) || 0) - (Date.parse(a.savedAt) || 0));
+  const label = (c) => c.machine ?? 'an unknown machine';
+  let winner = null;
+  try {
+    for (const c of candidates) {
+      const r = await probeChain(c.credentials, profile.oauthAccount, cfg, fetchImpl);
+      if (r.live) {
+        winner = { ...c, credentials: r.credentials };
+        break;
+      }
+    }
+  } catch (err) {
+    // Network trouble proves nothing about any chain; leave them all in place.
+    console.error(`"${name}": could not test its candidate chains (${err.message}); keeping all of them for now`);
+    return { profile, resolved: false, live: null };
+  }
+  writeBackup(`resolve-${name}`, profile, cfg);
+  const kept = winner ?? candidates[0];
+  saveProfile(
+    name,
+    {
+      credentials: kept.credentials,
+      oauthAccount: profile.oauthAccount ?? null,
+      machine: localMachine(cfg) ?? kept.machine,
+      ...(profile.movedAt ? { movedAt: profile.movedAt } : {}),
+    },
+    cfg,
+  );
+  if (getActive(cfg) === name && readCredentials(cfg) !== kept.credentials) writeCredentials(kept.credentials, cfg);
+  if (winner) {
+    const machines = [...new Set(candidates.map(label))].join(' and ');
+    console.error(`"${name}": refreshed on both ${machines}; chain from ${label(kept)} is live`);
+  } else {
+    console.error(`"${name}": every candidate chain is logged out; run "${cfg.prog} login ${name} --force" for a fresh one`);
+  }
+  return { profile: loadProfile(name, cfg), resolved: true, live: !!winner };
+}
+
+// switch/run read the profile synchronously, so main settles any pending
+// candidates first; the usage row builders do it inline since they are
+// already talking to the provider.
+async function resolvePending(name, cfg, fetchImpl = fetch) {
+  if (!profileExists(name, cfg)) return;
+  const profile = loadProfile(name, cfg);
+  if (profile.alternates?.length) await resolveAlternates(name, profile, cfg, fetchImpl);
 }
 
 // --- CLI --------------------------------------------------------------------------
@@ -1865,7 +1988,9 @@ export async function main(argv = process.argv.slice(2)) {
     await requirePassphrase();
   }
   if (!cmd) {
-    switchTo(await pickProfile(cfg, { dryRun }), { dryRun }, cfg);
+    const picked = await pickProfile(cfg, { dryRun });
+    if (!dryRun) await resolvePending(picked, cfg);
+    switchTo(picked, { dryRun }, cfg);
     return 0;
   }
   switch (cmd) {
@@ -1883,7 +2008,9 @@ export async function main(argv = process.argv.slice(2)) {
       saveCurrent(requireName(rest.find((a) => a !== '--force'), cfg), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'switch':
-      switchTo(requireName(rest[0], cfg), { dryRun }, cfg);
+      requireName(rest[0], cfg);
+      if (!dryRun) await resolvePending(rest[0], cfg);
+      switchTo(rest[0], { dryRun }, cfg);
       return 0;
     case 'list':
       console.log(formatList(cfg));
@@ -1938,10 +2065,12 @@ export async function main(argv = process.argv.slice(2)) {
         console.log(`[dry-run] would launch ${cfg.bin} with ${cfg.runEnvVar} for "${rest[0]}"`);
         return 0;
       }
+      await resolvePending(rest[0], cfg);
       return runProfile(rest[0], tail, cfg);
     }
     default:
       if (/^[a-z0-9-]+$/.test(cmd)) {
+        if (!dryRun) await resolvePending(cmd, cfg);
         switchTo(cmd, { dryRun }, cfg); // shorthand: ccswitch <name>
         return 0;
       }

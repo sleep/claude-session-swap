@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ccswitch-server — the sync server ccswitch clients push their PGP-encrypted
+// ccswitch-server: the sync server ccswitch clients push their PGP-encrypted
 // profile vaults to. It never sees a token: each vault is an opaque blob
 // signed and encrypted by the owner's OpenPGP key, and the owner's public key
 // (verified against the request signature) is the only identity there is.

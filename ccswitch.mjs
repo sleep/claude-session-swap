@@ -19,7 +19,13 @@ import readline from 'node:readline/promises';
 import { emitKeypressEvents } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
+import { createPgp, findGpg, generateKey, installHint, listSecretKeys } from './lib/gpg.mjs';
+import { buildEnvelope, canonicalJson, digestMap, mergeVaults } from './lib/sync-protocol.mjs';
+
 export class UsageError extends Error {}
+
+// Sync trouble is reported and then ignored: the local store keeps working.
+export class SyncError extends Error {}
 
 // A prompt the user walked away from, as opposed to something going wrong.
 export class CancelledError extends Error {}
@@ -702,6 +708,7 @@ export async function deleteProfileCmd(name, { force = false, dryRun = false } =
   }
   writeBackup(`delete-${name}`, loadProfile(name, cfg), cfg);
   deleteProfileFile(name, cfg);
+  recordTombstone(name, cfg);
   console.log(`deleted "${name}"`);
 }
 
@@ -1051,6 +1058,187 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
     setActive(parsed.active, cfg);
   }
   console.log(`imported ${imported} of ${names.length} profile(s) from ${from}`);
+}
+
+// --- Sync client ---------------------------------------------------------------------
+// Profiles are mirrored into a vault on a ccswitch-server so every machine
+// holds the newest chain for each account. The vault is signed and encrypted
+// with the user's own OpenPGP key (lib/gpg.mjs) and the server sees only
+// ciphertext. Merging is three-way against `base`, the digests each entry had
+// after the last sync (lib/sync-protocol.mjs); a double refresh keeps both
+// chains as alternates for resolveAlternates to probe.
+
+const SYNC_TIMEOUT_MS = 10_000;
+
+export function syncEnabled(cfg = config()) {
+  const sc = readSyncConfig(cfg);
+  return !!(sc?.server && sc?.fingerprint);
+}
+
+// A delete only reaches other machines as a tombstone in the vault, so it is
+// remembered here until it has been pushed (and kept so a stale copy of the
+// profile arriving later still loses to it).
+export function recordTombstone(name, cfg = config()) {
+  if (!syncEnabled(cfg)) return;
+  const sc = readSyncConfig(cfg);
+  writeSyncConfig({ tombstones: { ...(sc.tombstones ?? {}), [name]: new Date().toISOString() } }, cfg);
+}
+
+export function buildLocalVault(cfg = config()) {
+  const sc = readSyncConfig(cfg) ?? {};
+  const active = getActive(cfg);
+  const live = captureLive(cfg);
+  const profiles = {};
+  for (const p of listProfiles(cfg)) {
+    if (p.movedAt) {
+      profiles[p.name] = { movedAt: p.movedAt };
+      continue;
+    }
+    let { credentials = null, savedAt = null, machine = null } = p;
+    if (p.name === active && live.credentials && live.credentials !== p.credentials && sameAccount(live.oauthAccount, p.oauthAccount)) {
+      // The tool refreshed the live chain since the profile was written: that
+      // chain is the one to share, and saving it back keeps the profile, the
+      // vault and the next run's base digest in agreement.
+      credentials = live.credentials;
+      savedAt = new Date().toISOString();
+      machine = sc.machine ?? machine;
+      saveProfile(p.name, { ...p, credentials, oauthAccount: live.oauthAccount ?? p.oauthAccount, savedAt, machine }, cfg);
+    }
+    // A profile with no label was saved on this machine (save/login write
+    // none), so it is labelled here rather than travelling anonymously.
+    machine ??= sc.machine ?? null;
+    const entry = { credentials, oauthAccount: p.oauthAccount ?? null, savedAt };
+    if (machine) entry.machine = machine;
+    if (p.alternates?.length) entry.alternates = p.alternates;
+    profiles[p.name] = entry;
+  }
+  for (const [name, deletedAt] of Object.entries(sc.tombstones ?? {})) {
+    if (!profiles[name]) profiles[name] = { deletedAt, ...(sc.machine ? { machine: sc.machine } : {}) };
+  }
+  return profiles;
+}
+
+export function applyMerge(merged, { write, delete: del }, cfg = config()) {
+  if (write.length === 0 && del.length === 0) return;
+  writeBackup('sync-pull', Object.fromEntries([...write, ...del].map((n) => [n, quietLoadProfile(n, cfg)])), cfg);
+  const active = getActive(cfg);
+  const tombstones = { ...(readSyncConfig(cfg)?.tombstones ?? {}) };
+  for (const name of write) {
+    const e = merged[name];
+    saveProfile(
+      name,
+      { credentials: e.credentials, oauthAccount: e.oauthAccount ?? null, savedAt: e.savedAt ?? undefined, machine: e.machine, alternates: e.alternates },
+      cfg,
+    );
+    delete tombstones[name];
+    if (name === active && e.credentials && readCredentials(cfg) !== e.credentials) {
+      writeCredentials(e.credentials, cfg);
+      updateOauthAccount(e.oauthAccount ?? null, cfg);
+      warnIfToolRunning(cfg);
+    }
+  }
+  for (const name of del) {
+    if (profileExists(name, cfg)) deleteProfileFile(name, cfg);
+    // The live login stays; only the pointer goes, so the next switch cannot
+    // save the live chain back under a name that no longer exists.
+    if (name === active) setActive(null, cfg);
+    tombstones[name] = merged[name].deletedAt;
+  }
+  writeSyncConfig({ tombstones }, cfg);
+}
+
+async function syncRequest(op, { baseVersion, data }, cfg, { pgp, fetchImpl, now }) {
+  const sc = readSyncConfig(cfg);
+  const body = buildEnvelope({ op, vault: cfg.target, baseVersion, data }, pgp, now());
+  let res;
+  try {
+    res = await fetchImpl(`${sc.server.replace(/\/+$/, '')}/v1/vaults/${cfg.target}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(SYNC_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new SyncError(`could not reach ${sc.server}: ${err.cause?.message ?? err.message}`);
+  }
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {}
+  if (res.status === 404) throw new SyncError('server answered 404: wrong sync URL (the secret path must match the server)');
+  if (res.status === 401) throw new SyncError(`server rejected the signature (${json?.error ?? 'no detail'})`);
+  if (res.status === 409) return { status: 409, version: json.version, data: json.data };
+  if (!res.ok) throw new SyncError(`server error HTTP ${res.status}: ${json?.error ?? text.slice(0, 200)}`);
+  return { status: 200, ...json };
+}
+
+// The plaintext names its own vault and version so a server (or anyone on
+// the wire) cannot hand back a different vault or an older copy unnoticed.
+function openVault(data, version, cfg, pgp) {
+  let text;
+  try {
+    text = pgp.decrypt(data);
+  } catch (err) {
+    throw new SyncError(`could not decrypt the vault: ${err.message}`);
+  }
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    throw new SyncError('vault is not JSON');
+  }
+  if (v?.ccswitchVault !== 1 || !v.profiles || typeof v.profiles !== 'object') throw new SyncError('vault has an unknown format');
+  if (v.vault !== cfg.target) throw new SyncError(`server returned the "${v.vault}" vault instead of "${cfg.target}"`);
+  if (v.version !== version) throw new SyncError(`vault version mismatch (blob says ${v.version}, server says ${version}); refusing it`);
+  for (const name of Object.keys(v.profiles)) validateName(name);
+  return v.profiles;
+}
+
+function sealVault(profiles, version, cfg, pgp) {
+  return pgp.encrypt(JSON.stringify({ ccswitchVault: 1, vault: cfg.target, version, profiles }));
+}
+
+export function localSyncPending(cfg = config()) {
+  const sc = readSyncConfig(cfg);
+  return canonicalJson(digestMap(buildLocalVault(cfg))) !== canonicalJson(sc?.base ?? {});
+}
+
+export async function syncNow(cfg = config(), { pgp = null, fetchImpl = fetch, now = Date.now } = {}) {
+  const sc = readSyncConfig(cfg);
+  if (!sc?.server || !sc?.fingerprint) throw new UsageError(`sync is not set up; run "${cfg.prog} sync setup"`);
+  pgp ??= createPgp({ fingerprint: sc.fingerprint });
+  const deps = { pgp, fetchImpl, now };
+  const summary = { pulled: [], deleted: [], pushed: false, version: sc.version ?? 0 };
+  let local = buildLocalVault(cfg);
+  const got = await syncRequest('get', { baseVersion: 0 }, cfg, deps);
+  const known = sc.version ?? 0;
+  if (got.version < known || (got.data === null && known > 0)) {
+    throw new SyncError(`server returned an older vault (version ${got.version}, last seen ${known}); refusing to roll back`);
+  }
+  let version = got.version;
+  let remote = got.data === null ? {} : openVault(got.data, version, cfg, pgp);
+  const finish = (v, merged) => {
+    writeSyncConfig({ version: v, lastSyncAt: new Date(now()).toISOString(), base: digestMap(merged) }, cfg);
+    summary.version = v;
+    return summary;
+  };
+  for (let attempt = 0; ; attempt++) {
+    const { merged, localChanges, remoteStale } = mergeVaults(local, remote, sc.base ?? null);
+    applyMerge(merged, localChanges, cfg);
+    summary.pulled.push(...localChanges.write);
+    summary.deleted.push(...localChanges.delete);
+    if (!remoteStale) return finish(version, merged);
+    const put = await syncRequest('put', { baseVersion: version, data: sealVault(merged, version + 1, cfg, pgp) }, cfg, deps);
+    if (put.status === 200) {
+      summary.pushed = true;
+      return finish(put.version, merged);
+    }
+    if (attempt >= 2) throw new SyncError('the vault kept changing on the server; try again');
+    version = put.version;
+    remote = put.data === null ? {} : openVault(put.data, version, cfg, pgp);
+    local = merged;
+  }
 }
 
 // --- Isolated run (no global mutation) -----------------------------------------

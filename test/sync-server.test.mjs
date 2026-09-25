@@ -220,3 +220,93 @@ test('config: writeServerConfig creates a private file that readServerConfig ret
   assert.deepEqual(readServerConfig(dir), { host: '127.0.0.1', port: 8787, pathSecret: SECRET });
   assert.equal(readServerConfig(path.join(dir, 'missing')), null);
 });
+
+// --- CLI ------------------------------------------------------------------------------
+
+import { spawnSync } from 'node:child_process';
+import { UsageError, baseUrl, ensureGpg, main, setup } from '../sync-server.mjs';
+
+const SERVER_CLI = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'sync-server.mjs');
+
+function scriptedRl(answers) {
+  const asked = [];
+  return {
+    asked,
+    async question(q) {
+      asked.push(q);
+      if (answers.length === 0) throw new Error(`unexpected question: ${q}`);
+      return answers.shift();
+    },
+    close() {},
+  };
+}
+
+test('cli: setup writes server.json with a fresh 64-hex secret and prints the client URL', async (t) => {
+  const dir = dataDir(t);
+  const out = [];
+  const rl = scriptedRl(['', '9000', '']);
+  const cfg = await setup(dir, { rl, out: (l) => out.push(l) });
+  assert.equal(cfg.host, '127.0.0.1');
+  assert.equal(cfg.port, 9000);
+  assert.match(cfg.pathSecret, /^[0-9a-f]{64}$/);
+  assert.deepEqual(readServerConfig(dir), cfg);
+  assert.ok(out.join('\n').includes(`http://127.0.0.1:9000/${cfg.pathSecret}`));
+  assert.ok(fs.existsSync(path.join(dir, 'vaults')));
+});
+
+test('cli: setup on an existing config keeps the secret and asks before reconfiguring', async (t) => {
+  const dir = dataDir(t);
+  writeServerConfig(dir, { host: '127.0.0.1', port: 8787, pathSecret: SECRET });
+  await assert.rejects(setup(dir, { rl: scriptedRl(['n']), out: () => {} }), UsageError);
+  assert.equal(readServerConfig(dir).pathSecret, SECRET);
+  const cfg = await setup(dir, { rl: scriptedRl(['y', '0.0.0.0', '8443', 'https://sync.example.test']), out: () => {} });
+  assert.equal(cfg.pathSecret, SECRET);
+  assert.equal(cfg.host, '0.0.0.0');
+  assert.equal(cfg.publicUrl, 'https://sync.example.test');
+  assert.equal(baseUrl(cfg), `https://sync.example.test/${SECRET}`);
+});
+
+test('cli: setup rejects a bad port', async (t) => {
+  await assert.rejects(setup(dataDir(t), { rl: scriptedRl(['', 'nope', '']), out: () => {} }), /invalid port/);
+});
+
+test('cli: ensureGpg explains how to install gpg when it is missing', async () => {
+  const out = [];
+  const env = { ...process.env, CCSWITCH_GPG_BIN: '/nonexistent/gpg-xyz', PATH: '/nonexistent' };
+  await assert.rejects(
+    ensureGpg({ rl: scriptedRl(['n']), out: (l) => out.push(l), env, platform: 'darwin' }),
+    (err) => err instanceof UsageError && /not installed/.test(err.message),
+  );
+  assert.match(out.join('\n'), /brew install gnupg/);
+});
+
+test('cli: url and rotate-url print the client URL, rotate-url changes it', async (t) => {
+  const dir = dataDir(t);
+  writeServerConfig(dir, { host: '127.0.0.1', port: 8787, pathSecret: SECRET });
+  const logs = [];
+  const orig = console.log;
+  console.log = (l) => logs.push(l);
+  try {
+    assert.equal(await main(['--data-dir', dir, 'url']), 0);
+    assert.equal(logs[0], `http://127.0.0.1:8787/${SECRET}`);
+    assert.equal(await main(['--data-dir', dir, 'rotate-url']), 0);
+    assert.notEqual(logs[1], logs[0]);
+    assert.equal(logs[1], baseUrl(readServerConfig(dir)));
+  } finally {
+    console.log = orig;
+  }
+  await assert.rejects(main(['--data-dir', path.join(dir, 'nope'), 'url']), /run "ccswitch-server setup"/);
+  await assert.rejects(main(['--data-dir', dir, 'bogus']), /unknown command/);
+});
+
+test('cli: start without a config fails with a pointer to setup', (t) => {
+  const r = spawnSync(process.execPath, [SERVER_CLI, '--data-dir', path.join(dataDir(t), 'none'), 'start'], { encoding: 'utf8' });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /ccswitch-server setup/);
+});
+
+test('cli: --help lists the commands', () => {
+  const r = spawnSync(process.execPath, [SERVER_CLI, '--help'], { encoding: 'utf8' });
+  assert.equal(r.status, 0);
+  for (const cmd of ['setup', 'start', 'url', 'rotate-url']) assert.ok(r.stdout.includes(cmd), cmd);
+});

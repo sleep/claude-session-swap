@@ -2081,9 +2081,55 @@ export function syncStatus(cfg = config()) {
 
 export async function syncSetup(cfg = config(), deps = {}) {
   const g = { findGpg, listSecretKeys, generateKey, createPgp, ensureGpg, ...(deps.gpg ?? {}) };
-  const ask = deps.ask ?? promptLine;
-  const pick = deps.pick ?? pickIndex;
+  const reader = deps.ask ? null : questionReader();
+  const ask = deps.ask ?? reader.ask;
+  const pick = deps.pick ?? ((header, rows, initial) => pickIndex(header, rows, initial, { ask, prompt: 'Key: ' }));
   const out = deps.out ?? console.log;
+  try {
+    return await syncSetupWith(cfg, deps, { g, ask, pick, out });
+  } finally {
+    reader?.close();
+  }
+}
+
+// Several questions in a row need one readline interface that keeps every
+// line it receives: each interface slurps whatever piped stdin holds, and a
+// line arriving while no question is pending is otherwise dropped, so
+// "1\nhttp://...\n" piped into setup would answer only the first prompt.
+function questionReader() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  if (process.stdin.isTTY) {
+    return {
+      ask: async (q) => {
+        try {
+          return (await rl.question(q)).trim();
+        } catch (err) {
+          throw asCancel(err);
+        }
+      },
+      close: () => rl.close(),
+    };
+  }
+  const queue = [];
+  const waiting = [];
+  let closed = false;
+  rl.on('line', (line) => (waiting.length ? waiting.shift().resolve(line) : queue.push(line)));
+  rl.on('close', () => {
+    closed = true;
+    for (const w of waiting.splice(0)) w.reject(new CancelledError('input ended'));
+  });
+  return {
+    ask: async (q) => {
+      process.stdout.write(q);
+      if (queue.length) return queue.shift().trim();
+      if (closed) throw new CancelledError('input ended');
+      return (await new Promise((resolve, reject) => waiting.push({ resolve, reject }))).trim();
+    },
+    close: () => rl.close(),
+  };
+}
+
+async function syncSetupWith(cfg, deps, { g, ask, pick, out }) {
   if (!g.findGpg()) {
     try {
       await g.ensureGpg({ rl: { question: ask }, out });
@@ -2252,12 +2298,12 @@ function requireName(name, cfg) {
 // Arrow keys / wasd / vim keys move the highlight, enter selects. Falls back
 // to a numbered prompt when stdin or stdout isn't a TTY (piped, redirected,
 // or a non-interactive CI shell can't do raw-mode keypress reading at all).
-async function pickIndex(header, rows, initialIdx) {
+async function pickIndex(header, rows, initialIdx, { ask = promptLine, prompt = 'Switch to: ' } = {}) {
   const n = rows.length;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     const numbered = rows.map((r, i) => [String(i + 1), ...r]);
     console.log(renderTable(['#', ...header], numbered, terminalWidth()));
-    const answer = await promptLine('Switch to: ');
+    const answer = await ask(prompt);
     const idx = Number(answer) - 1;
     if (!Number.isInteger(idx) || idx < 0 || idx >= n) {
       throw new UsageError(`invalid selection ${JSON.stringify(answer)}`);

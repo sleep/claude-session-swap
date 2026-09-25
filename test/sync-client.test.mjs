@@ -553,3 +553,56 @@ test('help lists the sync commands', async (t) => {
   const out = lines.join('\n');
   for (const c of ['sync setup', 'sync status', 'sync off']) assert.ok(out.includes(c), c);
 });
+
+// --- real CLI, real gpg, piped stdin ------------------------------------------------
+
+import { spawn, spawnSync } from 'node:child_process';
+import { findGpg, generateKey } from '../lib/gpg.mjs';
+
+// The server lives in this process, so the CLI must run asynchronously or
+// its requests would wait on an event loop that spawnSync is blocking.
+function runCli(args, input, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI, ...args], { env: { ...process.env, ...env } });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(input);
+  });
+}
+
+const CLI = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'ccswitch.mjs');
+
+test('ccswitch sync setup works end to end with piped answers and a real key', { skip: findGpg() ? false : 'gpg not installed' }, async (t) => {
+  const { url, dir } = await server(t, { verify: null }); // real gpg verification on the server too
+  const gnupg = fs.mkdtempSync(path.join(os.tmpdir(), 'ccsw-e2e-gpg-'));
+  fs.chmodSync(gnupg, 0o700);
+  const env = { ...process.env, GNUPGHOME: gnupg };
+  t.after(() => {
+    spawnSync('gpgconf', ['--homedir', gnupg, '--kill', 'all'], { env });
+    fs.rmSync(gnupg, { recursive: true, force: true });
+  });
+  const fpr = generateKey('e2e <e2e@example.invalid>', { env, passphrase: '' });
+  const A = machine(t, 'a', url, { enabled: false });
+  saveProfile('work', { credentials: creds('w'), oauthAccount: acct('u1') }, A.cfg);
+  // Only GNUPGHOME is fixed here: the ccswitch home vars come from whichever
+  // machine() was selected last, read at spawn time.
+  const run = (args, input) => runCli(args, input, { GNUPGHOME: gnupg });
+  const r = await run(['sync', 'setup'], `1\n${url}\n`);
+  assert.equal(r.status, 0, r.stderr + r.stdout);
+  assert.match(r.stdout, /pushed local changes/);
+  assert.equal(readSyncConfig(A.cfg).fingerprint, fpr);
+  const stored = fs.readFileSync(path.join(dir, 'vaults', fpr, 'claude.json'), 'utf8');
+  assert.match(stored, /BEGIN PGP MESSAGE/);
+  assert.ok(!stored.includes('at-w'));
+
+  const B = machine(t, 'b', url, { enabled: false });
+  const rb = await run(['sync', 'setup'], `1\n${url}\n`);
+  assert.equal(rb.status, 0, rb.stderr + rb.stdout);
+  assert.match(rb.stdout, /pulled work/);
+  assert.equal(loadProfile('work', B.cfg).credentials, creds('w'));
+  const status = await run(['sync', 'status'], '');
+  assert.match(status.stdout, /vault:\s+claude v1/);
+});

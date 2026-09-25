@@ -15,10 +15,10 @@ Requires Node.js ≥ 20. Credentials are managed through the `~/.claude/.credent
 ```sh
 git clone <this repo>
 cd claude-session-swap
-npm link        # puts `ccswitch` and `kcswitch` on your PATH
+npm link        # puts `ccswitch`, `kcswitch` and `ccswitch-server` on your PATH
 ```
 
-No dependencies to install — the tool is a single zero-dependency script by design, since it handles OAuth refresh tokens and every third-party package would be supply-chain attack surface.
+No dependencies to install: the tool is zero-dependency by design (`ccswitch.mjs` plus two small modules under `lib/`), since it handles OAuth refresh tokens and every third-party package would be supply-chain attack surface.
 
 ## Usage
 
@@ -38,6 +38,10 @@ ccswitch export-all [file]    write ALL profiles + active pointer to one file (-
 ccswitch import-all [file]    merge such a file into this machine (--force overwrites existing profiles)
 ccswitch encrypt              encrypt profiles, backups and future exports with a passphrase
 ccswitch decrypt              turn passphrase encryption back off (rewrites the store as plaintext)
+ccswitch sync                 pull the newest token chains from your sync server and push local changes
+ccswitch sync setup           connect this machine to a ccswitch-server using your gpg key
+ccswitch sync status          show the sync server, key, vault version and unresolved chains
+ccswitch sync off             stop syncing on this machine (keeps local profiles and the vault)
 ```
 
 Every command accepts `--dry-run` to print what it would do without touching anything. Every command also works for Kimi Code by prefixing with `kimi` — `ccswitch kimi save work`, `ccswitch kimi usage`, etc.
@@ -109,9 +113,11 @@ Kimi refresh tokens rotate on refresh exactly like claude's, so all the multi-ma
 
 ### Using accounts on more than one machine
 
-The one rule: **a token chain works from exactly one machine.** OAuth refresh tokens rotate on every refresh, so the moment two machines hold the same chain, the first refresh strands the other machine's copy, and replaying a stranded chain makes Anthropic revoke the account's grant everywhere (that shows up as machines suddenly deauthorized). There are two safe setups:
+The underlying rule: **a token chain copied by hand works from exactly one machine.** OAuth refresh tokens rotate on every refresh, so the moment two machines hold the same chain, the first refresh strands the other machine's copy, and replaying a stranded chain makes Anthropic revoke the account's grant everywhere (that shows up as machines suddenly deauthorized). There are three ways to live with that:
 
-**Both machines in active use: log in separately on each.** Run `ccswitch login <name>` per account on the second machine. Each login creates an independent chain, and Anthropic keeps many chains alive per account, so machines logged in this way never log each other out. Never export a profile to a machine that is already using that account.
+**Sync (recommended for machines you use interchangeably).** Run your own `ccswitch-server` and connect each machine with `ccswitch sync setup`; every command then pulls the newest chains first and pushes what it changed. See [Syncing between machines](#syncing-between-machines).
+
+**Both machines in active use, no server: log in separately on each.** Run `ccswitch login <name>` per account on the second machine. Each login creates an independent chain, and Anthropic keeps many chains alive per account, so machines logged in this way never log each other out. Never export a profile to a machine that is already using that account.
 
 **Migrating to a new machine: move, don't copy.**
 
@@ -126,6 +132,42 @@ ccswitch import-all ccswitch-all.ccswitch.json
 `import-all` merges: profiles that already exist on the target machine are skipped (pass `--force` to overwrite them; moved tombstones are overwritten without it), and the exported active pointer is only adopted if the target has no active profile. If an imported profile matches the login already live on the target machine, the machine's own chain is kept, since the imported copy would die on the source machine's next refresh anyway. Backups and per-profile run dirs are machine-local and not included.
 
 Exported files hold live tokens in plaintext — treat them like passwords (or encrypt the store first, below).
+
+### Syncing between machines
+
+Sync mirrors your profiles through a small server you host, so the chain one machine just rotated is what the next machine picks up. Your OpenPGP key is the only credential: requests are signed with it, the vault is encrypted (and signed) to it, and the private key never leaves your machines. The server stores ciphertext it cannot read, keyed by your key's fingerprint, and it never sees profile names, emails or tokens. A full compromise of the server yields public keys and encrypted blobs.
+
+Both ends shell out to `gpg` (GnuPG 2.2 or newer), which keeps ccswitch dependency-free and lets you use a key that already lives in your keyring, hardware token included. Ed25519 keys are recommended; `sync setup` can generate one. The same secret key has to be present on every machine you sync (export it with `gpg --export-secret-keys --armor <fingerprint>` and import it on the other side over a channel you trust).
+
+**Server, once, on a box the clients can reach:**
+
+```sh
+ccswitch-server setup    # checks for gpg, asks host/port, mints the secret URL
+ccswitch-server start    # or: ccswitch-server --data-dir /srv/ccswitch start
+ccswitch-server url      # prints the client URL again
+```
+
+The server listens on plain HTTP (default `127.0.0.1:8787`); put a TLS reverse proxy in front for anything beyond localhost, or bind to `0.0.0.0` if you accept that. Every route sits under a random 64-character path, so the URL is the only thing standing between strangers and the vault store. Treat it as a secret: `sync setup` prompts for it (so it stays out of shell history), but a reverse proxy's access log will contain it. Registration is open; the server caps itself at 1024 vaults of 1 MiB each, and `ccswitch-server rotate-url` mints a fresh path if someone ever finds the old one (every client then needs `sync setup` again). Vaults live in `~/.ccswitch-server/vaults/<fingerprint>/` (`CCSWITCH_SERVER_DIR` or `--data-dir` to move them); the server is a single process by design.
+
+**Each machine:**
+
+```sh
+ccswitch sync setup      # picks your gpg key (or generates one), asks for the server URL, syncs
+ccswitch sync status
+ccswitch kimi sync setup # the kimi store has its own vault under the same key
+```
+
+From then on every command except the read-only and local-file ones (`list`, `export*`, `import*`, `encrypt`, `decrypt`) pulls before it runs and pushes afterwards if it changed any tokens. A pull is skipped when the last sync was under a minute ago, so statusline scripts calling `ccswitch usage` do not hammer the server. Sync trouble (server down, gpg unavailable, wrong URL) is printed as a warning and the command carries on with the local profiles; `--dry-run` never touches the network. `ccswitch sync` runs a sync on demand, and `ccswitch sync off` disconnects this machine without touching its profiles or the vault.
+
+**How conflicts are handled.** Merging is three-way against what each machine last synced: a profile changed on only one side simply wins, whatever the clocks say, and a delete travels as a tombstone so the profile does not come back from another machine. If two machines both refreshed the same chain between syncs, neither copy is thrown away: the newer one becomes the profile's chain and the older is kept as a candidate. The next time that profile is used (or on `ccswitch sync`), ccswitch tests the candidates newest-first with a harmless quota request, refreshing only when a token has expired, and stops at the first one the provider still accepts. A superseded chain is never refreshed once a newer one has worked, because that is what trips the provider's reuse detection. `sync status` lists profiles with candidates still to be tested.
+
+```
+$ ccswitch work
+"work": refreshed on both studio-3f9a and laptop-71c0; chain from laptop-71c0 is live
+switched to "work" (w@example.com)
+```
+
+**What the server can and cannot do.** It can refuse to store anything, drop the vault, or serve an old copy; it cannot read or forge one. The plaintext inside the ciphertext names its vault and version, so a swapped or rolled-back blob is refused rather than merged, and a vault that is not signed by your own key is refused even though it decrypts. Requests carry a signed timestamp, so a captured request is useless after five minutes and a replayed push hits the version check.
 
 ### Encryption at rest (opt-in)
 
@@ -143,6 +185,7 @@ Once encrypted, profiles, backups and any new exports are sealed with scrypt-der
 - **Run sessions** (`ccswitch run`) save refreshed tokens back into the profile when the session exits — OAuth refresh tokens are single-use, so without this the profile snapshot would go stale after the first in-session token refresh.
 - **Backups**: every mutation (switch, login, delete) first writes a timestamped snapshot to the store's `backups/` directory, so any state is recoverable.
 - **Safety checks**: a failed or abandoned `login` restores the previous credentials; switching warns if `claude`/`kimi` is currently running (open sessions keep the old account and may rewrite the stored credentials on token refresh); the active profile can't be deleted.
+- **Sync** (opt-in) keeps `sync.json` next to `state.json`: server URL, key fingerprint, a label for this machine, the vault version last seen, per-profile digests from the last sync (the merge base) and delete tombstones. A `sync.lock` file keeps two ccswitch processes from syncing the same store at once.
 
 ### Configuration
 
@@ -161,6 +204,8 @@ Environment variables override the defaults (mainly useful for testing). The kim
 | `KCSWITCH_KIMI_BIN` | `kimi` |
 | `CCSWITCH_CACHE_DIR` | `$XDG_CACHE_HOME/ccswitch`, else `~/.cache/ccswitch` (usage cache, shared by both stores) |
 | `CCSWITCH_PASSPHRASE` / `KCSWITCH_PASSPHRASE` | (unset — either works for either store) |
+| `CCSWITCH_GPG_BIN` | `gpg`, else `gpg2` (sync client and server) |
+| `CCSWITCH_SERVER_DIR` | `~/.ccswitch-server` (ccswitch-server data: config, vaults) |
 
 Region endpoints for kimi follow kimi's own resolution: `KIMI_CODE_BASE_URL` / `KIMI_CODE_OAUTH_HOST` (or `KIMI_OAUTH_HOST`), then the persisted login in `~/.kimi-code/config.toml`, then the mainland-cn defaults.
 
@@ -169,6 +214,8 @@ Region endpoints for kimi follow kimi's own resolution: `KIMI_CODE_BASE_URL` / `
 ```sh
 npm test    # node --test
 ```
+
+The gpg suite runs against the real `gpg` binary in throwaway keyrings and is skipped when gpg is not installed. `lib/sync-protocol.mjs` holds the pure envelope and merge logic, `lib/gpg.mjs` the gpg wrapper, and `sync-server.mjs` the server.
 
 ## License
 

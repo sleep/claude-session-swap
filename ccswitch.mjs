@@ -19,7 +19,13 @@ import readline from 'node:readline/promises';
 import { emitKeypressEvents } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 
+import { GpgError, createPgp, ensureGpg, findGpg, generateKey, listSecretKeys } from './lib/gpg.mjs';
+import { buildEnvelope, digestMap, entryDigest, mergeVaults } from './lib/sync-protocol.mjs';
+
 export class UsageError extends Error {}
+
+// Sync trouble is reported and then ignored: the local store keeps working.
+export class SyncError extends Error {}
 
 // A prompt the user walked away from, as opposed to something going wrong.
 export class CancelledError extends Error {}
@@ -399,7 +405,7 @@ function quietLoadProfile(name, cfg) {
   }
 }
 
-export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt }, cfg = config()) {
+export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt, machine, alternates }, cfg = config()) {
   validateName(name);
   ensureHome(cfg);
   // Kimi display fields (nickname, email, level) arrive via best-effort /me
@@ -413,8 +419,17 @@ export function saveProfile(name, { credentials, oauthAccount, savedAt, movedAt 
       };
     }
   }
+  // machine and alternates come from sync: which machine last saved this
+  // chain, and rival chains from a double refresh awaiting a probe.
   const body = JSON.stringify(
-    { credentials, oauthAccount, savedAt: savedAt ?? new Date().toISOString(), ...(movedAt ? { movedAt } : {}) },
+    {
+      credentials,
+      oauthAccount,
+      savedAt: savedAt ?? new Date().toISOString(),
+      ...(movedAt ? { movedAt } : {}),
+      ...(machine ? { machine } : {}),
+      ...(Array.isArray(alternates) && alternates.length > 0 ? { alternates } : {}),
+    },
     null,
     2,
   );
@@ -489,6 +504,28 @@ export function setActive(name, cfg = config()) {
 
 export function storeEncrypted(cfg = config()) {
   return readState(cfg).encrypted === true;
+}
+
+// Sync settings live beside state.json: server URL, signing key, this
+// machine's label, and the bookkeeping the three-way merge needs.
+export function readSyncConfig(cfg = config()) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(cfg.home, 'sync.json'), 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+export function writeSyncConfig(patch, cfg = config(), { replace = false } = {}) {
+  ensureHome(cfg);
+  const next = replace ? patch : { ...(readSyncConfig(cfg) ?? {}), ...patch };
+  fs.writeFileSync(path.join(cfg.home, 'sync.json'), JSON.stringify(next, null, 2), { mode: 0o600 });
+  return next;
+}
+
+export function localMachine(cfg = config()) {
+  return readSyncConfig(cfg)?.machine ?? null;
 }
 
 export function writeBackup(reason, payload, cfg = config()) {
@@ -671,6 +708,7 @@ export async function deleteProfileCmd(name, { force = false, dryRun = false } =
   }
   writeBackup(`delete-${name}`, loadProfile(name, cfg), cfg);
   deleteProfileFile(name, cfg);
+  recordTombstone(name, cfg);
   console.log(`deleted "${name}"`);
 }
 
@@ -1020,6 +1058,240 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
     setActive(parsed.active, cfg);
   }
   console.log(`imported ${imported} of ${names.length} profile(s) from ${from}`);
+}
+
+// --- Sync client ---------------------------------------------------------------------
+// Profiles are mirrored into a vault on a ccswitch-server so every machine
+// holds the newest chain for each account. The vault is signed and encrypted
+// with the user's own OpenPGP key (lib/gpg.mjs) and the server sees only
+// ciphertext. Merging is three-way against `base`, the digests each entry had
+// after the last sync (lib/sync-protocol.mjs); a double refresh keeps both
+// chains as alternates for resolveAlternates to probe.
+
+const SYNC_TIMEOUT_MS = 10_000;
+
+export function syncEnabled(cfg = config()) {
+  const sc = readSyncConfig(cfg);
+  return !!(sc?.server && sc?.fingerprint);
+}
+
+// A delete only reaches other machines as a tombstone in the vault, so it is
+// remembered here until it has been pushed (and kept so a stale copy of the
+// profile arriving later still loses to it).
+export function recordTombstone(name, cfg = config()) {
+  if (!syncEnabled(cfg)) return;
+  const sc = readSyncConfig(cfg);
+  const tombstone = { deletedAt: new Date().toISOString(), ...(sc.machine ? { machine: sc.machine } : {}) };
+  writeSyncConfig({ tombstones: { ...(sc.tombstones ?? {}), [name]: tombstone } }, cfg);
+}
+
+// Tombstones are kept exactly as they travel in the vault: rebuilding one
+// with a different machine label would look like a change to every merge and
+// keep two machines pushing the vault back and forth forever.
+function storedTombstone(t) {
+  return typeof t === 'string' ? { deletedAt: t } : t;
+}
+
+export function buildLocalVault(cfg = config()) {
+  const sc = readSyncConfig(cfg) ?? {};
+  const active = getActive(cfg);
+  const live = captureLive(cfg);
+  const profiles = {};
+  for (const p of listProfiles(cfg)) {
+    if (p.movedAt) {
+      profiles[p.name] = { movedAt: p.movedAt };
+      continue;
+    }
+    let { credentials = null, savedAt = null, machine = null } = p;
+    if (p.name === active && live.credentials && live.credentials !== p.credentials && sameAccount(live.oauthAccount, p.oauthAccount)) {
+      // The tool refreshed the live chain since the profile was written: that
+      // chain is the one to share, and saving it back keeps the profile, the
+      // vault and the next run's base digest in agreement.
+      credentials = live.credentials;
+      savedAt = new Date().toISOString();
+      machine = sc.machine ?? machine;
+      saveProfile(p.name, { ...p, credentials, oauthAccount: live.oauthAccount ?? p.oauthAccount, savedAt, machine }, cfg);
+    }
+    // A profile with no label was saved on this machine (save/login write
+    // none), so it is labelled here rather than travelling anonymously.
+    machine ??= sc.machine ?? null;
+    const entry = { credentials, oauthAccount: p.oauthAccount ?? null, savedAt };
+    if (machine) entry.machine = machine;
+    if (p.alternates?.length) entry.alternates = p.alternates;
+    profiles[p.name] = entry;
+  }
+  for (const [name, t] of Object.entries(sc.tombstones ?? {})) {
+    if (!profiles[name]) profiles[name] = storedTombstone(t);
+  }
+  return profiles;
+}
+
+export function applyMerge(merged, { write, delete: del }, cfg = config(), { liveWas } = {}) {
+  if (write.length === 0 && del.length === 0) return;
+  writeBackup('sync-pull', Object.fromEntries([...write, ...del].map((n) => [n, quietLoadProfile(n, cfg)])), cfg);
+  const active = getActive(cfg);
+  const tombstones = { ...(readSyncConfig(cfg)?.tombstones ?? {}) };
+  for (const name of write) {
+    const e = merged[name];
+    saveProfile(
+      name,
+      { credentials: e.credentials, oauthAccount: e.oauthAccount ?? null, savedAt: e.savedAt ?? undefined, machine: e.machine, alternates: e.alternates },
+      cfg,
+    );
+    delete tombstones[name];
+    if (name !== active || !e.credentials) continue;
+    const liveNow = readCredentials(cfg);
+    if (liveNow === e.credentials) continue;
+    if (liveWas !== undefined && liveNow && liveNow !== liveWas) {
+      // The tool rotated the live chain while the sync was in flight. That
+      // chain is newer than anything the vault knows, so it stays live and
+      // rides along as a candidate for the next probe instead of being
+      // overwritten by the pulled copy.
+      const rotated = { credentials: liveNow, savedAt: new Date().toISOString(), machine: localMachine(cfg) ?? undefined };
+      const alternates = [rotated, ...(e.alternates ?? [])].filter((a, i, all) => all.findIndex((b) => b.credentials === a.credentials) === i);
+      saveProfile(name, { credentials: e.credentials, oauthAccount: e.oauthAccount ?? null, savedAt: e.savedAt ?? undefined, machine: e.machine, alternates }, cfg);
+      console.error(`"${name}": the live login was rotated while syncing; keeping both chains to test on the next use`);
+      continue;
+    }
+    writeCredentials(e.credentials, cfg);
+    updateOauthAccount(e.oauthAccount ?? null, cfg);
+    warnIfToolRunning(cfg);
+  }
+  for (const name of del) {
+    if (profileExists(name, cfg)) deleteProfileFile(name, cfg);
+    // The live login stays; only the pointer goes, so the next switch cannot
+    // save the live chain back under a name that no longer exists.
+    if (name === active) setActive(null, cfg);
+    tombstones[name] = merged[name];
+  }
+  writeSyncConfig({ tombstones }, cfg);
+}
+
+async function syncRequest(op, { baseVersion, data }, cfg, { pgp, fetchImpl, now }) {
+  const sc = readSyncConfig(cfg);
+  let body;
+  try {
+    body = buildEnvelope({ op, vault: cfg.target, baseVersion, data }, pgp, now());
+  } catch (err) {
+    throw new SyncError(`gpg could not sign the request: ${err.message}`);
+  }
+  let res;
+  try {
+    res = await fetchImpl(`${sc.server.replace(/\/+$/, '')}/v1/vaults/${cfg.target}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(SYNC_TIMEOUT_MS),
+    });
+  } catch (err) {
+    throw new SyncError(`could not reach ${sc.server}: ${err.cause?.message ?? err.message}`);
+  }
+  const text = await res.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {}
+  if (res.status === 404) throw new SyncError('server answered 404: wrong sync URL (the secret path must match the server)');
+  if (res.status === 401) throw new SyncError(`server rejected the signature (${json?.error ?? 'no detail'})`);
+  if (!res.ok && res.status !== 409) throw new SyncError(`server error HTTP ${res.status}: ${json?.error ?? text.slice(0, 200)}`);
+  if (!json || typeof json !== 'object' || !Number.isSafeInteger(json.version) || json.version < 0) {
+    throw new SyncError(`server answered HTTP ${res.status} with an unusable body`);
+  }
+  if (res.status === 409) return { status: 409, version: json.version, data: json.data ?? null };
+  return { status: 200, ...json };
+}
+
+// The plaintext names its own vault and version so a server (or anyone on
+// the wire) cannot hand back a different vault or an older copy unnoticed.
+function openVault(data, version, cfg, pgp) {
+  let text;
+  try {
+    text = pgp.decrypt(data);
+  } catch (err) {
+    throw new SyncError(`could not decrypt the vault: ${err.message}`);
+  }
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    throw new SyncError('vault is not JSON');
+  }
+  if (v?.ccswitchVault !== 1 || !v.profiles || typeof v.profiles !== 'object') throw new SyncError('vault has an unknown format');
+  if (v.vault !== cfg.target) throw new SyncError(`server returned the "${v.vault}" vault instead of "${cfg.target}"`);
+  if (v.version !== version) throw new SyncError(`vault version mismatch (blob says ${v.version}, server says ${version}); refusing it`);
+  for (const name of Object.keys(v.profiles)) validateName(name);
+  return v.profiles;
+}
+
+function sealVault(profiles, version, cfg, pgp) {
+  try {
+    return pgp.encrypt(JSON.stringify({ ccswitchVault: 1, vault: cfg.target, version, profiles }));
+  } catch (err) {
+    throw new SyncError(`gpg could not encrypt the vault: ${err.message}`);
+  }
+}
+
+export function localSyncPending(cfg = config()) {
+  const base = readSyncConfig(cfg)?.base ?? {};
+  const local = buildLocalVault(cfg);
+  for (const name of new Set([...Object.keys(local), ...Object.keys(base)])) {
+    const e = local[name];
+    if (e && typeof e.movedAt === 'string') continue; // a moved marker never travels, so it never differs
+    if (!e || entryDigest(e) !== base[name]) return true;
+  }
+  return false;
+}
+
+export async function syncNow(cfg = config(), { pgp = null, fetchImpl = fetch, now = Date.now } = {}) {
+  const sc = readSyncConfig(cfg);
+  if (!sc?.server || !sc?.fingerprint) throw new UsageError(`sync is not set up; run "${cfg.prog} sync setup"`);
+  pgp ??= createPgp({ fingerprint: sc.fingerprint });
+  const deps = { pgp, fetchImpl, now };
+  const summary = { pulled: [], deleted: [], pushed: false, version: sc.version ?? 0 };
+  let local = buildLocalVault(cfg);
+  const liveWas = readCredentials(cfg);
+  const known = sc.version ?? 0;
+  // Every reply that carries a vault is held to the same floor: a server
+  // that can roll a client back through a 409 is no better than one that
+  // rolls it back through a get.
+  const notOlder = (reply) => {
+    if (reply.version < known || (reply.data === null && known > 0)) {
+      throw new SyncError(`server returned an older vault (version ${reply.version}, last seen ${known}); refusing to roll back`);
+    }
+  };
+  const got = await syncRequest('get', { baseVersion: 0 }, cfg, deps);
+  notOlder(got);
+  let version = got.version;
+  let remote = got.data === null ? {} : openVault(got.data, version, cfg, pgp);
+  let base = sc.base ?? null;
+  const finish = (v, merged) => {
+    writeSyncConfig({ version: v, lastSyncAt: new Date(now()).toISOString(), base: digestMap(merged) }, cfg);
+    summary.version = v;
+    return summary;
+  };
+  for (let attempt = 0; ; attempt++) {
+    const { merged, localChanges, remoteStale } = mergeVaults(local, remote, base);
+    applyMerge(merged, localChanges, cfg, { liveWas });
+    summary.pulled.push(...localChanges.write);
+    summary.deleted.push(...localChanges.delete);
+    if (!remoteStale) return finish(version, merged);
+    const put = await syncRequest('put', { baseVersion: version, data: sealVault(merged, version + 1, cfg, pgp) }, cfg, deps);
+    if (put.status === 200) {
+      if (put.version !== version + 1) throw new SyncError(`server stored the vault as version ${put.version} instead of ${version + 1}; refusing it`);
+      summary.pushed = true;
+      return finish(put.version, merged);
+    }
+    if (put.version <= version) throw new SyncError(`server answered a conflict with version ${put.version}, not newer than ${version}; refusing to roll back`);
+    notOlder(put);
+    if (attempt >= 2) throw new SyncError('the vault kept changing on the server; try again');
+    // What was just merged descends from the vault just seen, so that vault
+    // is the base for the retry; the old base would make every entry the
+    // server moved on look like a two-sided conflict.
+    base = digestMap(remote);
+    version = put.version;
+    remote = put.data === null ? {} : openVault(put.data, version, cfg, pgp);
+    local = merged;
+  }
 }
 
 // --- Isolated run (no global mutation) -----------------------------------------
@@ -1500,8 +1772,11 @@ const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets
 async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
   const rows = [];
   let succeeded = 0;
-  for (const p of profiles) {
+  for (let p of profiles) {
     const isActive = p.name === active;
+    if (p.alternates?.length && !p.movedAt) {
+      p = { name: p.name, ...(await resolveAlternates(p.name, p, cfg, fetchImpl)).profile };
+    }
     if (p.movedAt) {
       // The chain rotates on another machine now; refreshing it from here
       // would revoke it there.
@@ -1577,8 +1852,11 @@ const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', '
 async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
   const rows = [];
   let succeeded = 0;
-  for (const p of profiles) {
+  for (let p of profiles) {
     const isActive = p.name === active;
+    if (p.alternates?.length && !p.movedAt) {
+      p = { name: p.name, ...(await resolveAlternates(p.name, p, cfg, fetchImpl)).profile };
+    }
     let account = displayAccount(p.oauthAccount) ?? '-';
     if (p.movedAt) {
       // The chain rotates on another machine now; refreshing it from here
@@ -1666,6 +1944,346 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
   return succeeded > 0 ? 0 : 1;
 }
 
+// --- Candidate chains -------------------------------------------------------------
+// Two machines that both refreshed the same profile between syncs each hold a
+// chain the other does not know about. Sync keeps both (see mergeVaults) and
+// the next use asks the provider which one still works. Probing goes newest
+// first and stops at the first live chain: refreshing a superseded token after
+// a newer one already worked is what trips reuse detection and revokes the
+// whole family, so the older candidates are only ever touched once the newer
+// ones are known to be dead.
+
+async function probeChain(credentials, oauthAccount, cfg, fetchImpl) {
+  const kimi = cfg.target === 'kimi';
+  const conn = kimi ? readKimiConnection(cfg) : null;
+  if (!tokenExpired(credentials)) {
+    try {
+      if (kimi) await fetchKimiUsage(credentials, fetchImpl, { baseUrl: oauthAccount?.baseUrl ?? conn.baseUrl });
+      else await fetchUsage(credentials, fetchImpl);
+      return { live: true, credentials };
+    } catch (err) {
+      // 429 means the token was accepted and only the quota endpoint balked.
+      if (err instanceof RateLimitedError) return { live: true, credentials };
+      if (!(err instanceof AuthDeadError)) throw err;
+    }
+  }
+  try {
+    const fresh = kimi
+      ? await refreshKimiCredentials(credentials, fetchImpl, { oauthHost: oauthAccount?.oauthHost ?? conn.oauthHost })
+      : await refreshCredentials(credentials, fetchImpl);
+    return { live: true, credentials: fresh };
+  } catch (err) {
+    if (err instanceof AuthDeadError) return { live: false };
+    throw err;
+  }
+}
+
+export async function resolveAlternates(name, profile, cfg = config(), fetchImpl = fetch) {
+  const alternates = Array.isArray(profile.alternates) ? profile.alternates : [];
+  if (alternates.length === 0) return { profile, resolved: false, live: null };
+  const candidates = [{ credentials: profile.credentials, savedAt: profile.savedAt, machine: profile.machine }, ...alternates];
+  if (getActive(cfg) === name) {
+    // The tool may have rotated the live chain since the profile was
+    // written; that chain is the newest of all and must be tried first.
+    const live = captureLive(cfg);
+    if (live.credentials && live.credentials !== profile.credentials && sameAccount(live.oauthAccount, profile.oauthAccount)) {
+      candidates.unshift({ credentials: live.credentials, savedAt: new Date().toISOString(), machine: localMachine(cfg) ?? 'this machine' });
+    }
+  }
+  candidates.sort((a, b) => (Date.parse(b.savedAt) || 0) - (Date.parse(a.savedAt) || 0));
+  for (let i = candidates.length - 1; i >= 0; i--) if (typeof candidates[i].credentials !== 'string') candidates.splice(i, 1);
+  const label = (c) => c.machine ?? 'an unknown machine';
+  let winner = null;
+  try {
+    for (const c of candidates) {
+      const r = await probeChain(c.credentials, profile.oauthAccount, cfg, fetchImpl);
+      if (r.live) {
+        winner = { ...c, credentials: r.credentials };
+        break;
+      }
+    }
+  } catch (err) {
+    // Network trouble proves nothing about any chain; leave them all in place.
+    console.error(`"${name}": could not test its candidate chains (${err.message}); keeping all of them for now`);
+    return { profile, resolved: false, live: null };
+  }
+  writeBackup(`resolve-${name}`, profile, cfg);
+  const kept = winner ?? candidates[0];
+  saveProfile(
+    name,
+    {
+      credentials: kept.credentials,
+      oauthAccount: profile.oauthAccount ?? null,
+      machine: localMachine(cfg) ?? kept.machine,
+      ...(profile.movedAt ? { movedAt: profile.movedAt } : {}),
+    },
+    cfg,
+  );
+  if (getActive(cfg) === name && readCredentials(cfg) !== kept.credentials) writeCredentials(kept.credentials, cfg);
+  if (winner) {
+    const machines = [...new Set(candidates.map(label))].join(' and ');
+    console.error(`"${name}": refreshed on both ${machines}; chain from ${label(kept)} is live`);
+  } else {
+    console.error(`"${name}": every candidate chain is logged out; run "${cfg.prog} login ${name} --force" for a fresh one`);
+  }
+  return { profile: loadProfile(name, cfg), resolved: true, live: !!winner };
+}
+
+// switch/run read the profile synchronously, so main settles any pending
+// candidates first; the usage row builders do it inline since they are
+// already talking to the provider.
+async function resolvePending(name, cfg, fetchImpl = fetch) {
+  if (!profileExists(name, cfg)) return;
+  const profile = loadProfile(name, cfg);
+  if (profile.alternates?.length) await resolveAlternates(name, profile, cfg, fetchImpl);
+}
+
+// --- Sync commands and auto-sync ------------------------------------------------------
+
+const SYNC_LOCK_STALE_MS = 60_000;
+// Statusline scripts call "usage" every few seconds; one pull a minute is
+// plenty, and pushes only happen when something actually changed.
+const SYNC_DEBOUNCE_MS = 60_000;
+// Read-only or explicitly local commands never sync.
+const SYNC_SKIP = new Set(['sync', 'list', 'encrypt', 'decrypt', 'export', 'export-all', 'import', 'import-all']);
+
+// Two ccswitch processes syncing the same home at once would race on
+// sync.json and the profiles; the second one just skips its sync.
+export async function withSyncLock(cfg, fn) {
+  ensureHome(cfg);
+  const file = path.join(cfg.home, 'sync.lock');
+  const acquire = () => {
+    try {
+      fs.writeFileSync(file, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: 'wx', mode: 0o600 });
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      return false;
+    }
+  };
+  if (!acquire()) {
+    let at = 0;
+    try {
+      at = Date.parse(JSON.parse(fs.readFileSync(file, 'utf8')).at) || 0;
+    } catch {}
+    if (Date.now() - at < SYNC_LOCK_STALE_MS) return null;
+    fs.rmSync(file, { force: true }); // a crashed sync left it behind
+    if (!acquire()) return null;
+  }
+  try {
+    return await fn();
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
+}
+
+function describeSync(summary) {
+  const parts = [];
+  if (summary.pulled.length) parts.push(`pulled ${summary.pulled.join(', ')}`);
+  if (summary.deleted.length) parts.push(`deleted ${summary.deleted.join(', ')}`);
+  if (summary.pushed) parts.push('pushed local changes');
+  return parts.length ? `synced: ${parts.join('; ')} (vault v${summary.version})` : `already in sync (vault v${summary.version})`;
+}
+
+async function autoSync(cfg, deps) {
+  try {
+    const r = await withSyncLock(cfg, () => syncNow(cfg, deps));
+    if (r === null) console.error('sync: another ccswitch is syncing; skipped');
+    return true;
+  } catch (err) {
+    // Remembered so a dead server costs one attempt per window, not a
+    // timeout on every command.
+    writeSyncConfig({ lastAttemptAt: new Date().toISOString() }, cfg);
+    console.error(`sync: ${err.message}; continuing with local profiles`);
+    return false;
+  }
+}
+
+function syncedRecently(cfg) {
+  const sc = readSyncConfig(cfg) ?? {};
+  const last = Math.max(Date.parse(sc.lastSyncAt ?? '') || 0, Date.parse(sc.lastAttemptAt ?? '') || 0);
+  return Date.now() - last < SYNC_DEBOUNCE_MS;
+}
+
+async function syncBefore(cfg, deps) {
+  if (syncedRecently(cfg)) return true;
+  return autoSync(cfg, deps);
+}
+
+async function syncAfter(cfg, deps) {
+  const sc = readSyncConfig(cfg) ?? {};
+  if (Date.now() - (Date.parse(sc.lastAttemptAt ?? '') || 0) < SYNC_DEBOUNCE_MS) return; // still backing off
+  let pending;
+  try {
+    pending = localSyncPending(cfg);
+  } catch (err) {
+    console.error(`sync: ${err.message}; local changes were not pushed`);
+    return;
+  }
+  if (pending) await autoSync(cfg, deps);
+}
+
+export function syncStatus(cfg = config()) {
+  const sc = readSyncConfig(cfg);
+  if (!sc?.server || !sc?.fingerprint) return `sync: not set up on this machine (run "${cfg.prog} sync setup")`;
+  const pending = listProfiles(cfg)
+    .filter((p) => p.alternates?.length && !p.movedAt)
+    .map((p) => `${p.name} (${p.alternates.length + 1} candidate chains)`);
+  const gpg = findGpg();
+  return [
+    `server:    ${sc.server}`,
+    `key:       ${sc.fingerprint}`,
+    `machine:   ${sc.machine ?? '-'}`,
+    `vault:     ${cfg.target} v${sc.version ?? 0}`,
+    `last sync: ${sc.lastSyncAt ?? 'never'}`,
+    `pending:   ${pending.length ? pending.join(', ') : 'none'}`,
+    `gpg:       ${gpg ? `${gpg.version} (${gpg.bin})` : 'not found'}`,
+  ].join('\n');
+}
+
+export async function syncSetup(cfg = config(), deps = {}) {
+  const g = { findGpg, listSecretKeys, generateKey, createPgp, ensureGpg, ...(deps.gpg ?? {}) };
+  const reader = deps.ask ? null : questionReader();
+  const ask = deps.ask ?? reader.ask;
+  const pick = deps.pick ?? ((header, rows, initial) => pickIndex(header, rows, initial, { ask, prompt: 'Key: ' }));
+  const out = deps.out ?? console.log;
+  try {
+    return await syncSetupWith(cfg, deps, { g, ask, pick, out });
+  } finally {
+    reader?.close();
+  }
+}
+
+// Several questions in a row need one readline interface that keeps every
+// line it receives: each interface slurps whatever piped stdin holds, and a
+// line arriving while no question is pending is otherwise dropped, so
+// "1\nhttp://...\n" piped into setup would answer only the first prompt.
+function questionReader() {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  if (process.stdin.isTTY) {
+    return {
+      ask: async (q) => {
+        try {
+          return (await rl.question(q)).trim();
+        } catch (err) {
+          throw asCancel(err);
+        }
+      },
+      close: () => rl.close(),
+    };
+  }
+  const queue = [];
+  const waiting = [];
+  let closed = false;
+  rl.on('line', (line) => (waiting.length ? waiting.shift().resolve(line) : queue.push(line)));
+  rl.on('close', () => {
+    closed = true;
+    for (const w of waiting.splice(0)) w.reject(new CancelledError('input ended'));
+  });
+  return {
+    ask: async (q) => {
+      process.stdout.write(q);
+      if (queue.length) return queue.shift().trim();
+      if (closed) throw new CancelledError('input ended');
+      return (await new Promise((resolve, reject) => waiting.push({ resolve, reject }))).trim();
+    },
+    close: () => rl.close(),
+  };
+}
+
+async function syncSetupWith(cfg, deps, { g, ask, pick, out }) {
+  if (!g.findGpg()) {
+    try {
+      await g.ensureGpg({ rl: { question: ask }, out });
+    } catch (err) {
+      throw new UsageError(err.message);
+    }
+  }
+  const existing = readSyncConfig(cfg) ?? {};
+  const keys = g.listSecretKeys();
+  const rows = [...keys.map((k) => [k.fingerprint.slice(-16), k.uid ?? '-']), ['(new)', 'generate a new key for sync']];
+  out(keys.length ? 'Which gpg key identifies you to the sync server?' : 'No gpg secret keys found; a new one can be generated.');
+  const idx = await pick(['key', 'identity'], rows, Math.max(0, keys.findIndex((k) => k.fingerprint === existing.fingerprint)));
+  let fingerprint;
+  if (idx === keys.length) {
+    const uid = await ask('Your name and email for the new key (e.g. "Me <me@example.com>"): ');
+    if (!uid) throw new UsageError('a name is needed to generate a key');
+    fingerprint = g.generateKey(uid);
+    out(`generated key ${fingerprint}`);
+  } else {
+    fingerprint = keys[idx].fingerprint;
+  }
+  const server = (await ask(`Sync server URL${existing.server ? ` [${existing.server}]` : ''}: `)) || existing.server;
+  if (!/^https?:\/\/\S+$/.test(server ?? '')) throw new UsageError('the sync server URL must start with http:// or https://');
+  const machine =
+    existing.machine ?? `${os.hostname().split('.')[0].slice(0, 12).toLowerCase() || 'machine'}-${crypto.randomBytes(2).toString('hex')}`;
+  // A different server or key means a different vault: the merge base and
+  // version belong to the old one and must not be carried over.
+  const changed = existing.server !== server || existing.fingerprint !== fingerprint;
+  const next = changed
+    ? { server, fingerprint, machine, version: 0, lastSyncAt: null, base: {}, tombstones: existing.tombstones ?? {} }
+    : { ...existing, machine };
+  writeSyncConfig(next, cfg, { replace: true });
+  out(`sync configured: ${server}\n  key ${fingerprint} (this machine is "${machine}")`);
+  const pgp = deps.pgp ?? g.createPgp({ fingerprint });
+  try {
+    const summary = await withSyncLock(cfg, () => syncNow(cfg, { pgp, fetchImpl: deps.fetchImpl ?? fetch }));
+    if (summary) out(describeSync(summary));
+  } catch (err) {
+    if (err instanceof SyncError) {
+      throw new UsageError(`${err.message}\nthe settings were saved; fix the problem and run "${cfg.prog} sync"`);
+    }
+    throw err;
+  }
+  return readSyncConfig(cfg);
+}
+
+async function syncCmd(sub, cfg, deps, dryRun = false) {
+  if (dryRun && sub !== 'status') {
+    const sc = readSyncConfig(cfg);
+    const what =
+      sub === 'setup' ? 'ask for a gpg key and server URL, then run a first sync'
+      : sub === 'off' ? 'remove sync.json (profiles and the server vault stay)'
+      : `sync ${cfg.target} profiles with ${sc?.server ?? '(no server configured)'}`;
+    console.log(`[dry-run] would ${what}`);
+    return 0;
+  }
+  if (sub === 'setup') {
+    await syncSetup(cfg, deps);
+    return 0;
+  }
+  if (sub === 'status') {
+    console.log(syncStatus(cfg));
+    return 0;
+  }
+  if (sub === 'off') {
+    fs.rmSync(path.join(cfg.home, 'sync.json'), { force: true });
+    console.log('sync is off on this machine; local profiles and the server vault are untouched');
+    return 0;
+  }
+  if (sub !== undefined) throw new UsageError(`unknown sync command ${JSON.stringify(sub)} (setup, status, off, or none)`);
+  if (!syncEnabled(cfg)) throw new UsageError(`sync is not set up; run "${cfg.prog} sync setup"`);
+  try {
+    let summary = await withSyncLock(cfg, () => syncNow(cfg, deps));
+    if (summary === null) throw new SyncError('another ccswitch is syncing right now; try again in a moment');
+    // Candidate chains left by a double refresh get settled here rather than
+    // on the next switch, and the winner goes straight back to the server.
+    let resolved = 0;
+    for (const p of listProfiles(cfg)) {
+      if (p.alternates?.length && !p.movedAt && (await resolveAlternates(p.name, p, cfg, deps.fetchImpl)).resolved) resolved++;
+    }
+    if (resolved > 0) summary = (await withSyncLock(cfg, () => syncNow(cfg, deps))) ?? summary;
+    console.log(describeSync(summary));
+    return 0;
+  } catch (err) {
+    if (err instanceof SyncError) {
+      console.error(`sync: ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+}
+
 // --- CLI --------------------------------------------------------------------------
 
 // Every command line is rendered from this table so the invocation column stays
@@ -1687,6 +2305,10 @@ const COMMANDS = [
   ['import-all [file]', 'merge such a file into this machine (--force overwrites existing profiles)'],
   ['encrypt', 'encrypt profiles, backups and future exports with a passphrase'],
   ['decrypt', 'turn passphrase encryption back off (rewrites the store as plaintext)'],
+  ['sync', 'pull the newest token chains from your sync server and push local changes'],
+  ['sync setup', 'connect this machine to a ccswitch-server using your gpg key'],
+  ['sync status', 'show the sync server, key, vault version and unresolved chains'],
+  ['sync off', 'stop syncing on this machine (keeps local profiles and the vault)'],
 ];
 
 function help(cfg) {
@@ -1725,12 +2347,14 @@ ${table}
 
 ${crossRef}
 
-Tokens rotate on every refresh, so each chain works from ONE machine only; a
-chain used from two machines gets the account logged out everywhere. For a
-second machine that stays in use, run "${cfg.prog} login <name>" there: accounts
-may be logged in from several machines, each with its own chain. To migrate
-instead, use "export-all --move" / "import-all": --move retires the source
-copies so this machine cannot revoke the moved chains later.
+Tokens rotate on every refresh, so a chain copied by hand works from ONE
+machine only; a chain used from two machines gets the account logged out
+everywhere. To share accounts across machines run "${cfg.prog} sync setup" on
+each: profiles are mirrored through a ccswitch-server as a vault encrypted with
+your own gpg key, every command pulls the newest chains first, and a chain
+refreshed on two machines at once is kept twice and tested on the next use.
+Without sync, use "export-all --move" / "import-all" to migrate: --move retires
+the source copies so this machine cannot revoke the moved chains later.
 
 State lives in ${store}. Every mutation writes a backup there first.
 Unencrypted stores keep tokens in plaintext; run "${cfg.prog} encrypt" to protect
@@ -1745,12 +2369,12 @@ function requireName(name, cfg) {
 // Arrow keys / wasd / vim keys move the highlight, enter selects. Falls back
 // to a numbered prompt when stdin or stdout isn't a TTY (piped, redirected,
 // or a non-interactive CI shell can't do raw-mode keypress reading at all).
-async function pickIndex(header, rows, initialIdx) {
+async function pickIndex(header, rows, initialIdx, { ask = promptLine, prompt = 'Switch to: ' } = {}) {
   const n = rows.length;
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
     const numbered = rows.map((r, i) => [String(i + 1), ...r]);
     console.log(renderTable(['#', ...header], numbered, terminalWidth()));
-    const answer = await promptLine('Switch to: ');
+    const answer = await ask(prompt);
     const idx = Number(answer) - 1;
     if (!Number.isInteger(idx) || idx < 0 || idx >= n) {
       throw new UsageError(`invalid selection ${JSON.stringify(answer)}`);
@@ -1830,7 +2454,7 @@ async function pickProfile(cfg, { dryRun = false } = {}, fetchImpl = fetch) {
   return profiles[idx].name;
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), deps = {}) {
   const sep = argv.indexOf('--');
   const head = sep === -1 ? argv : argv.slice(0, sep);
   const tail = sep === -1 ? [] : argv.slice(sep + 1);
@@ -1864,8 +2488,24 @@ export async function main(argv = process.argv.slice(2)) {
   if (storeEncrypted(cfg) || (importSrc && fileIsEncrypted(importSrc))) {
     await requirePassphrase();
   }
+  const syncDeps = { pgp: deps.pgp ?? null, fetchImpl: deps.fetchImpl ?? fetch };
+  if (cmd === 'sync') return syncCmd(rest[0], cfg, syncDeps, dryRun);
+  // Every other command runs between a pull (so it sees the newest chains)
+  // and a push (so what it changed reaches the other machines). Neither can
+  // fail the command itself. Dry runs never touch the network.
+  const auto = syncEnabled(cfg) && !dryRun && !SYNC_SKIP.has(cmd ?? '');
+  const pulled = auto ? await syncBefore(cfg, syncDeps) : false;
+  try {
+    return await dispatch();
+  } finally {
+    if (auto && pulled) await syncAfter(cfg, syncDeps);
+  }
+
+  async function dispatch() {
   if (!cmd) {
-    switchTo(await pickProfile(cfg, { dryRun }), { dryRun }, cfg);
+    const picked = await pickProfile(cfg, { dryRun });
+    if (!dryRun) await resolvePending(picked, cfg);
+    switchTo(picked, { dryRun }, cfg);
     return 0;
   }
   switch (cmd) {
@@ -1883,7 +2523,9 @@ export async function main(argv = process.argv.slice(2)) {
       saveCurrent(requireName(rest.find((a) => a !== '--force'), cfg), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;
     case 'switch':
-      switchTo(requireName(rest[0], cfg), { dryRun }, cfg);
+      requireName(rest[0], cfg);
+      if (!dryRun) await resolvePending(rest[0], cfg);
+      switchTo(rest[0], { dryRun }, cfg);
       return 0;
     case 'list':
       console.log(formatList(cfg));
@@ -1938,14 +2580,17 @@ export async function main(argv = process.argv.slice(2)) {
         console.log(`[dry-run] would launch ${cfg.bin} with ${cfg.runEnvVar} for "${rest[0]}"`);
         return 0;
       }
+      await resolvePending(rest[0], cfg);
       return runProfile(rest[0], tail, cfg);
     }
     default:
       if (/^[a-z0-9-]+$/.test(cmd)) {
+        if (!dryRun) await resolvePending(cmd, cfg);
         switchTo(cmd, { dryRun }, cfg); // shorthand: ccswitch <name>
         return 0;
       }
       throw new UsageError(`unknown command ${JSON.stringify(cmd)} (see ${cfg.progBin} --help)`);
+  }
   }
 }
 
@@ -1965,7 +2610,7 @@ export function reportFatal(err) {
     console.error('\naborted');
     return 130; // 128 + SIGINT, so callers can tell a cancel from a failure
   }
-  console.error(`${progName()}: ${err instanceof UsageError ? err.message : (err.stack ?? err.message)}`);
+  console.error(`${progName()}: ${err instanceof UsageError || err instanceof SyncError || err instanceof GpgError ? err.message : (err.stack ?? err.message)}`);
   return 1;
 }
 

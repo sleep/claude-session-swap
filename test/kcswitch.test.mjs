@@ -859,9 +859,10 @@ test('cli: the kcswitch bin name makes kimi the default target', (t) => {
   const { home } = sandbox(t);
   const cfg = config('kimi');
   saveProfile('work', { credentials: kimiCreds({}), oauthAccount: { userId: 'u-1', nickname: 'Shy' } }, cfg);
+  // npm link installs the bin as a symlink, and a copy could not resolve the
+  // CLI's ./lib imports anyway.
   const alias = path.join(home, 'kcswitch');
-  fs.copyFileSync(CLI, alias);
-  fs.chmodSync(alias, 0o755);
+  fs.symlinkSync(CLI, alias);
   const r = spawnSync(alias, ['list'], { encoding: 'utf8', env: { ...process.env, ...kimiEnv() } });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /work +Shy/); // the kimi store, without any "kimi" argument
@@ -870,9 +871,10 @@ test('cli: the kcswitch bin name makes kimi the default target', (t) => {
 // Both bins are the same script; only argv[0] differs, so every message the
 // kimi bin prints has to name itself rather than its sibling.
 function kcBin(home) {
+  // npm link installs the bin as a symlink, and a copy could not resolve the
+  // CLI's ./lib imports anyway.
   const alias = path.join(home, 'kcswitch');
-  fs.copyFileSync(CLI, alias);
-  fs.chmodSync(alias, 0o755);
+  fs.symlinkSync(CLI, alias);
   return alias;
 }
 

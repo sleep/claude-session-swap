@@ -657,7 +657,7 @@ test('kimiUsageCmd refreshes expired tokens, persists before the usage call, enr
   assert.match(out, /63%/);
   assert.match(out, /5h .*20%/);
   assert.match(out, /\$4\.75/);
-  assert.match(out, /ok \(refreshed\)/);
+  assert.match(out, /✓/);
   // /me enrichment landed in the profile and the rendered row:
   assert.equal(loadProfile('work', cfg).oauthAccount.nickname, 'Shy');
   assert.match(out, /work +Shy/);
@@ -698,11 +698,11 @@ test('kimiUsageCmd fails soft per profile and only exits 1 when all fail', async
   };
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /logged out/);
+  assert.match(lines.join('\n'), /✗/);
   saveProfile('gone', { credentials: kimiCreds({ sub: 'u-x' }), oauthAccount: { userId: 'u-x' }, movedAt: new Date().toISOString() }, cfg);
   lines.length = 0;
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /moved to another machine/);
+  assert.match(lines.join('\n'), /→/);
 });
 
 test('kimiUsageCmd shows the last known usage on 429, in its own cache namespace', async (t) => {
@@ -727,7 +727,7 @@ test('kimiUsageCmd shows the last known usage on 429, in its own cache namespace
   lines.length = 0;
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
   assert.match(lines.join('\n'), /30%/);
-  assert.match(lines.join('\n'), /rate limited, cached just now/);
+  assert.match(lines.join('\n'), /◷ <1m/);
 });
 
 test('kimiUsageCmd --dry-run touches the network never', async (t) => {

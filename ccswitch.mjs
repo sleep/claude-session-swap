@@ -1148,11 +1148,11 @@ export function readUsageCache(name, cfg = config()) {
 
 export function formatAgo(ms, now = Date.now()) {
   const mins = Math.max(0, Math.round((now - ms) / 60000));
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1) return '<1m';
+  if (mins < 60) return `${mins}m`;
   const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h${String(mins % 60).padStart(2, '0')}m ago`;
-  return `${Math.floor(h / 24)}d${String(h % 24).padStart(2, '0')}h ago`;
+  if (h < 24) return `${h}h${String(mins % 60).padStart(2, '0')}m`;
+  return `${Math.floor(h / 24)}d${String(h % 24).padStart(2, '0')}h`;
 }
 
 // Shared by both row builders: fetch, cache on success, fall back on 429.
@@ -1164,12 +1164,12 @@ async function usageWithCache(name, cfg, fetchFn) {
     } catch {
       // An unwritable cache dir only costs the 429 fallback, not this row.
     }
-    return { usage, stale: null };
+    return { usage, cachedAt: null };
   } catch (err) {
     if (!(err instanceof RateLimitedError)) throw err;
     const cached = readUsageCache(name, cfg);
     if (!cached) throw err;
-    return { usage: cached.usage, stale: `rate limited, cached ${formatAgo(cached.fetchedAt)}` };
+    return { usage: cached.usage, cachedAt: cached.fetchedAt };
   }
 }
 
@@ -1437,6 +1437,25 @@ export function formatBar(utilization, { color = false } = {}) {
   return `\x1b[${code}m${bar}\x1b[0m ${label}`;
 }
 
+// Status cells are a single glyph (plus detail where there is some). The glyphs
+// are text-presentation symbols rather than emoji so they stay one column wide
+// and take ANSI color like the bars do.
+export function formatStatus(status, { color = false, now = Date.now() } = {}) {
+  const paint = (code, text) => (color ? `\x1b[${code}m${text}\x1b[0m` : text);
+  switch (status.kind) {
+    case 'ok':
+      return paint(32, '✓');
+    case 'cached':
+      return paint(33, `◷ ${formatAgo(status.at, now)}`);
+    case 'dead':
+      return paint(31, '✗');
+    case 'moved':
+      return paint(2, '→');
+    default:
+      return paint(31, `! ${status.message}`);
+  }
+}
+
 export function formatResetIn(resetsAt, now = Date.now()) {
   if (!resetsAt) return '-';
   const ms = new Date(resetsAt).getTime() - now;
@@ -1507,12 +1526,12 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
       // would revoke it there.
       rows.push([
         isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-', '-', '-',
-        'moved to another machine',
+        formatStatus({ kind: 'moved' }, { color }),
       ]);
       continue;
     }
     let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
-    let status = 'ok';
+    let status = { kind: 'ok' };
     let usage = null;
     try {
       if (!credentials) throw new AuthDeadError('no credentials stored');
@@ -1522,14 +1541,13 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
         // can go wrong with the usage call (or the process).
         saveProfile(p.name, { credentials, oauthAccount: p.oauthAccount }, cfg);
         if (isActive) writeCredentials(credentials, cfg);
-        status = 'ok (refreshed)';
       }
       const got = await usageWithCache(p.name, cfg, () => fetchUsage(credentials, fetchImpl));
       usage = got.usage;
-      if (got.stale) status = got.stale;
+      if (got.cachedAt) status = { kind: 'cached', at: got.cachedAt };
       succeeded++;
     } catch (err) {
-      status = err instanceof AuthDeadError ? 'logged out' : `error: ${err.message}`;
+      status = err instanceof AuthDeadError ? { kind: 'dead' } : { kind: 'error', message: err.message };
     }
     rows.push([
       isActive ? '*' : ' ',
@@ -1541,7 +1559,7 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
       usage ? formatResetIn(usage.sevenDay?.resetsAt ?? null) : '-',
       usage ? formatBar(usage.fable?.utilization ?? null, { color }) : '-',
       usage ? formatResetIn(usage.fable?.resetsAt ?? null) : '-',
-      status,
+      formatStatus(status, { color }),
     ]);
   }
   return { header: CLAUDE_USAGE_HEADER, rows, succeeded };
@@ -1585,13 +1603,13 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
       // would revoke it there.
       rows.push([
         isActive ? '*' : ' ', p.name, account, '-', '-', '-', '-',
-        'moved to another machine',
+        formatStatus({ kind: 'moved' }, { color }),
       ]);
       continue;
     }
     let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
     let oauthAccount = p.oauthAccount;
-    let status = 'ok';
+    let status = { kind: 'ok' };
     let usage = null;
     try {
       if (!credentials) throw new AuthDeadError('no credentials stored');
@@ -1601,12 +1619,11 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
         // can go wrong with the usage call (or the process).
         saveProfile(p.name, { credentials, oauthAccount }, cfg);
         if (isActive) writeCredentials(credentials, cfg);
-        status = 'ok (refreshed)';
       }
       const baseUrl = oauthAccount?.baseUrl ?? readKimiConnection(cfg).baseUrl;
       const got = await usageWithCache(p.name, cfg, () => fetchKimiUsage(credentials, fetchImpl, { baseUrl }));
       usage = got.usage;
-      if (got.stale) status = got.stale;
+      if (got.cachedAt) status = { kind: 'cached', at: got.cachedAt };
       succeeded++;
       // Best-effort: cache the account's display fields into the profile so
       // list/usage show a nickname instead of a bare user id.
@@ -1623,7 +1640,7 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
         }
       }
     } catch (err) {
-      status = err instanceof AuthDeadError ? 'logged out' : `error: ${err.message}`;
+      status = err instanceof AuthDeadError ? { kind: 'dead' } : { kind: 'error', message: err.message };
     }
     rows.push([
       isActive ? '*' : ' ',
@@ -1639,7 +1656,7 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
           : '-'
         : '-',
       usage?.booster ? formatCents(usage.booster.balanceCents, usage.booster.currency) : '-',
-      status,
+      formatStatus(status, { color }),
     ]);
   }
   return { header: KIMI_USAGE_HEADER, rows, succeeded };

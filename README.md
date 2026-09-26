@@ -69,14 +69,16 @@ ccswitch run work -- -p "summarize this repo"
 
 ```
    name      email          5h          resets    7d          resets    fable       resets    status
-*  personal  me@gmail.com   ███▏   63%  in 2h04m  █      19%  in 5d21h  ██▌    49%  in 4d02h  ok
-   work      me@corp.com    ██▉    58%  in 3h27m  ████▎  84%  in 5d23h  -           -         ok (refreshed)
-   old       old@gmail.com  -           -         -           -         -           -         logged out
+*  personal  me@gmail.com   ███▏   63%  in 2h04m  █      19%  in 5d21h  ██▌    49%  in 4d02h  ✓
+   work      me@corp.com    ██▉    58%  in 3h27m  ████▎  84%  in 5d23h  -           -         ◷ 12m
+   old       old@gmail.com  -           -         -           -         -           -         ✗
 ```
 
-`fable` is Fable's own weekly cap, reported separately from the general 7d window; it shows `-` on accounts that have no such cap. It queries Anthropic's OAuth usage endpoint with each profile's stored token. Expired access tokens are refreshed first, and the rotated token pair is written back to the profile *before* it's used — so a crash can never lose a login. Valid tokens are never refreshed (no pointless rotation), and a profile whose chain is dead just shows `logged out` without breaking the others.
+`fable` is Fable's own weekly cap, reported separately from the general 7d window; it shows `-` on accounts that have no such cap. It queries Anthropic's OAuth usage endpoint with each profile's stored token. Expired access tokens are refreshed first, and the rotated token pair is written back to the profile *before* it's used — so a crash can never lose a login. Valid tokens are never refreshed (no pointless rotation), and a profile whose chain is dead just shows `✗` without breaking the others.
 
-Each successful lookup is cached per profile in `~/.cache/ccswitch/usage/` (or `$XDG_CACHE_HOME/ccswitch/usage/`). If the usage endpoint answers `429`, that profile shows its last known numbers with a status like `rate limited, cached 12m ago` instead of an error. Reset countdowns stay accurate because they are stored as absolute times. Other failures never fall back to the cache, so stale numbers can't hide a real problem.
+The status column is one glyph per profile: `✓` (green) fetched live, `◷ 12m` (yellow) showing cached numbers from 12 minutes ago, `✗` (red) logged out, `→` moved to another machine, and `! <message>` (red) for any other failure.
+
+Each successful lookup is cached per profile in `~/.cache/ccswitch/usage/` (or `$XDG_CACHE_HOME/ccswitch/usage/`). If the usage endpoint answers `429`, that profile shows its last known numbers with a yellow `◷ 12m` status (the age of those numbers) instead of an error. Reset countdowns stay accurate because they are stored as absolute times. Other failures never fall back to the cache, so stale numbers can't hide a real problem.
 
 ### Kimi Code accounts
 
@@ -101,8 +103,8 @@ Differences from the claude side, all consequences of how kimi stores its login:
 
 ```
    name  account  week        resets    limits                  booster  status
-*  main  Shy      ██▉    58%  in 3d04h  5h ▏       4% in 1h12m  $9.50    ok
-   alt   u2abc…   -           -         -                     -        logged out
+*  main  Shy      ██▉    58%  in 3d04h  5h ▏       4% in 1h12m  $9.50    ✓
+   alt   u2abc…   -           -         -                     -        ✗
 ```
 
 Kimi refresh tokens rotate on refresh exactly like claude's, so all the multi-machine rules below apply unchanged: one chain, one machine; `export --move` / `export-all --move` to migrate.

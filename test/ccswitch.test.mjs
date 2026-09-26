@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo, formatStatus } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -1063,7 +1063,7 @@ test('usageCmd refreshes expired tokens and persists before the usage call', asy
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
   assert.equal(persistedAtUsageTime, 'at-new'); // persist-before-use
-  assert.match(lines.join('\n'), /ok \(refreshed\)/);
+  assert.match(lines.join('\n'), /✓/);
 });
 
 test('usageCmd uses live credentials for the active profile without refreshing', async (t) => {
@@ -1113,13 +1113,13 @@ test('usageCmd caches usage and shows the last known value on 429', async (t) =>
   lines.length = 0;
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
   assert.match(lines.join('\n'), /42%/);
-  assert.match(lines.join('\n'), /rate limited, cached just now/);
+  assert.match(lines.join('\n'), /◷ <1m/);
 
   // Other failures never fall back: stale numbers would hide a real problem.
   status = 500;
   lines.length = 0;
   assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
-  assert.match(lines.join('\n'), /error: usage request failed \(HTTP 500\)/);
+  assert.match(lines.join('\n'), /! usage request failed \(HTTP 500\)/);
   assert.doesNotMatch(lines.join('\n'), /42%/);
 });
 
@@ -1129,7 +1129,7 @@ test('usageCmd reports a 429 as an error when nothing is cached yet', async (t) 
   saveProfile('work', { credentials: usageCreds(), oauthAccount: {} }, cfg);
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, async () => ({ ok: false, status: 429 })), 1);
-  assert.match(lines.join('\n'), /error: usage request failed \(HTTP 429\)/);
+  assert.match(lines.join('\n'), /! usage request failed \(HTTP 429\)/);
 });
 
 test('deleting a profile drops its cached usage', (t) => {
@@ -1144,10 +1144,22 @@ test('deleting a profile drops its cached usage', (t) => {
 
 test('formatAgo renders coarse relative times', () => {
   const now = 10 * 86400000;
-  assert.equal(formatAgo(now - 10000, now), 'just now');
-  assert.equal(formatAgo(now - 5 * 60000, now), '5m ago');
-  assert.equal(formatAgo(now - 125 * 60000, now), '2h05m ago');
-  assert.equal(formatAgo(now - 26 * 3600000, now), '1d02h ago');
+  assert.equal(formatAgo(now - 10000, now), '<1m');
+  assert.equal(formatAgo(now - 5 * 60000, now), '5m');
+  assert.equal(formatAgo(now - 125 * 60000, now), '2h05m');
+  assert.equal(formatAgo(now - 26 * 3600000, now), '1d02h');
+});
+
+test('formatStatus renders one glyph per state, colored only on request', () => {
+  const now = 10 * 86400000;
+  assert.equal(formatStatus({ kind: 'ok' }), '✓');
+  assert.equal(formatStatus({ kind: 'cached', at: now - 60000 }, { now }), '◷ 1m');
+  assert.equal(formatStatus({ kind: 'dead' }), '✗');
+  assert.equal(formatStatus({ kind: 'moved' }), '→');
+  assert.equal(formatStatus({ kind: 'error', message: 'boom' }), '! boom');
+  assert.equal(formatStatus({ kind: 'ok' }, { color: true }), '\x1b[32m✓\x1b[0m');
+  assert.equal(formatStatus({ kind: 'cached', at: now }, { color: true, now }), '\x1b[33m◷ <1m\x1b[0m');
+  assert.equal(formatStatus({ kind: 'dead' }, { color: true }), '\x1b[31m✗\x1b[0m');
 });
 
 test('usageCmd fails soft per profile and only exits 1 when all fail', async (t) => {
@@ -1163,7 +1175,7 @@ test('usageCmd fails soft per profile and only exits 1 when all fail', async (t)
   };
   const lines = captureLog(t);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
-  assert.match(lines.join('\n'), /logged out/);
+  assert.match(lines.join('\n'), /✗/);
   deleteProfileFile('good', cfg);
   assert.equal(await usageCmd({}, cfg, fetchImpl), 1);
 });
@@ -1208,8 +1220,8 @@ test('usageCmd renders the fable window and keeps every row column-aligned', asy
   // A moved profile builds its row by hand: check it still has the full column
   // count, or `status` slides silently under the `fable` header.
   const statusCol = out[0].indexOf('status');
-  assert.equal(out.find((l) => /premium/.test(l)).indexOf('ok'), statusCol);
-  assert.equal(out.find((l) => /gone/.test(l)).indexOf('moved to'), statusCol);
+  assert.equal(out.find((l) => /premium/.test(l)).indexOf('✓'), statusCol);
+  assert.equal(out.find((l) => /gone/.test(l)).indexOf('→'), statusCol);
 });
 
 test('usageCmd --dry-run touches the network never', async (t) => {
@@ -1314,7 +1326,7 @@ test('a moved profile shows as moved in usage and is never refreshed', async (t)
     }),
     1,
   );
-  assert.match(lines.join('\n'), /moved to another machine/);
+  assert.match(lines.join('\n'), /→/);
 });
 
 test('import-all keeps the live chain when an imported profile matches the live login', (t) => {

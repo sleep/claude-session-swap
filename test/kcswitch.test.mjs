@@ -653,7 +653,7 @@ test('kimiUsageCmd refreshes expired tokens, persists before the usage call, enr
   assert.equal(await usageCmd({}, cfg, fetchImpl), 0); // routes to the kimi implementation
   assert.equal(persistedAtUsageTime, newToken); // persist-before-use
   const out = lines.join('\n');
-  assert.match(out, /name +account +week +resets +limits +booster +status/);
+  assert.match(out, /name +account +week +resets +limits +booster +state/);
   assert.match(out, /63%/);
   assert.match(out, /5h .*20%/);
   assert.match(out, /\$4\.75/);

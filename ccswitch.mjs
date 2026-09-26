@@ -1439,9 +1439,16 @@ export function formatBar(utilization, { color = false } = {}) {
 
 // Status cells are a single glyph (plus detail where there is some). The glyphs
 // are text-presentation symbols rather than emoji so they stay one column wide
-// and take ANSI color like the bars do.
+// and take ANSI color like the bars do. Anything narrower than the header label
+// is centered under it; status is always the last column, so left padding alone
+// does it, whichever table (usage or picker) the cell lands in.
+const STATUS_LABEL = 'state';
+
 export function formatStatus(status, { color = false, now = Date.now() } = {}) {
-  const paint = (code, text) => (color ? `\x1b[${code}m${text}\x1b[0m` : text);
+  const paint = (code, text) => {
+    const pad = ' '.repeat(Math.max(0, Math.floor((STATUS_LABEL.length - text.length) / 2)));
+    return pad + (color ? `\x1b[${code}m${text}\x1b[0m` : text);
+  };
   switch (status.kind) {
     case 'ok':
       return paint(32, '✓');
@@ -1511,7 +1518,7 @@ export function shouldUseColor(env = process.env) {
   return true;
 }
 
-const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', 'status'];
+const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', STATUS_LABEL];
 
 // Shared by usageCmd (prints the table as-is) and pickProfile (adds a "#"
 // column and prompts for a selection), so the picker's per-account limits
@@ -1587,7 +1594,7 @@ export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImp
   return succeeded > 0 ? 0 : 1;
 }
 
-const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', 'status'];
+const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', STATUS_LABEL];
 
 // Kimi's /usages shape differs from claude's: a weekly summary row, extra
 // scoped limit windows, and a booster wallet balance. Columns follow suit.

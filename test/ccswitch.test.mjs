@@ -1152,14 +1152,16 @@ test('formatAgo renders coarse relative times', () => {
 
 test('formatStatus renders one glyph per state, colored only on request', () => {
   const now = 10 * 86400000;
-  assert.equal(formatStatus({ kind: 'ok' }), '✓');
+  // Narrow cells are centered under the 5-column "state" label.
+  assert.equal(formatStatus({ kind: 'ok' }), '  ✓');
   assert.equal(formatStatus({ kind: 'cached', at: now - 60000 }, { now }), '◷ 1m');
-  assert.equal(formatStatus({ kind: 'dead' }), '✗');
-  assert.equal(formatStatus({ kind: 'moved' }), '→');
+  assert.equal(formatStatus({ kind: 'dead' }), '  ✗');
+  assert.equal(formatStatus({ kind: 'moved' }), '  →');
   assert.equal(formatStatus({ kind: 'error', message: 'boom' }), '! boom');
-  assert.equal(formatStatus({ kind: 'ok' }, { color: true }), '\x1b[32m✓\x1b[0m');
+  assert.equal(formatStatus({ kind: 'error', message: 'request failed' }), '! request failed');
+  assert.equal(formatStatus({ kind: 'ok' }, { color: true }), '  \x1b[32m✓\x1b[0m');
   assert.equal(formatStatus({ kind: 'cached', at: now }, { color: true, now }), '\x1b[33m◷ <1m\x1b[0m');
-  assert.equal(formatStatus({ kind: 'dead' }, { color: true }), '\x1b[31m✗\x1b[0m');
+  assert.equal(formatStatus({ kind: 'dead' }, { color: true }), '  \x1b[31m✗\x1b[0m');
 });
 
 test('usageCmd fails soft per profile and only exits 1 when all fail', async (t) => {
@@ -1215,13 +1217,13 @@ test('usageCmd renders the fable window and keeps every row column-aligned', asy
     0,
   );
   const out = lines.join('\n').split('\n');
-  assert.match(out[0], /7d\s+resets\s+fable\s+resets\s+status/);
+  assert.match(out[0], /7d\s+resets\s+fable\s+resets\s+state/);
   assert.match(out.find((l) => /premium/.test(l)), / 49%/);
   // A moved profile builds its row by hand: check it still has the full column
-  // count, or `status` slides silently under the `fable` header.
-  const statusCol = out[0].indexOf('status');
-  assert.equal(out.find((l) => /premium/.test(l)).indexOf('✓'), statusCol);
-  assert.equal(out.find((l) => /gone/.test(l)).indexOf('→'), statusCol);
+  // count, or `state` slides silently under the `fable` header.
+  const statusCol = out[0].indexOf('state');
+  assert.equal(out.find((l) => /premium/.test(l)).indexOf('✓'), statusCol + 2);
+  assert.equal(out.find((l) => /gone/.test(l)).indexOf('→'), statusCol + 2);
 });
 
 test('usageCmd --dry-run touches the network never', async (t) => {

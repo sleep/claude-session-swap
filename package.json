@@ -3,6 +3,14 @@
   "version": "1.0.0",
   "description": "Manage multiple Claude Code and Kimi Code subscription accounts (macOS and Linux)",
   "type": "module",
+  "main": "./ccswitch.mjs",
+  "types": "./ccswitch.d.ts",
+  "exports": {
+    ".": { "types": "./ccswitch.d.ts", "default": "./ccswitch.mjs" },
+    "./ccswitch.mjs": "./ccswitch.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": ["ccswitch.mjs", "ccswitch.d.ts", "README.md"],
   "bin": { "ccswitch": "./ccswitch.mjs", "kcswitch": "./ccswitch.mjs" },
   "scripts": { "test": "node --test" },
   "engines": { "node": ">=20" },

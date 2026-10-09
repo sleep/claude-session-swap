@@ -6,23 +6,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo, formatStatus, keychainServiceFor } from '../ccswitch.mjs';
+import { sandbox, fakeClaudeBin, fakeSecurity, onDarwin, usageCreds, captureLog, captureErr, runCli } from './helpers.mjs';
 
-// Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
-// including the credentials file, so the suite runs on any platform and the
-// real login is never touched. The keychain service name is randomized so
-// the darwin migration/eviction path never sees a real entry.
-export function sandbox(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ccswitch-test-'));
-  process.env.CCSWITCH_HOME = path.join(home, 'profiles-home');
-  process.env.CCSWITCH_CLAUDE_JSON = path.join(home, 'claude.json');
-  process.env.CCSWITCH_CACHE_DIR = path.join(home, 'cache');
-  process.env.CCSWITCH_CREDENTIALS_FILE = path.join(home, 'credentials.json');
-  process.env.CCSWITCH_KEYCHAIN_SERVICE =
-    `ccswitch-test-${process.pid}-${Math.random().toString(36).slice(2)}`;
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  return { home };
-}
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo, formatStatus, keychainServiceFor } from '../ccswitch.mjs';
 
 test('config picks up env overrides', (t) => {
   const { home } = sandbox(t);
@@ -322,13 +308,6 @@ test('deleteProfileCmd backs up before deleting', async (t) => {
   const backup = JSON.parse(fs.readFileSync(path.join(cfg.home, 'backups', match), 'utf8'));
   assert.equal(backup.credentials, 'y');
 });
-
-export function fakeClaudeBin(home, script) {
-  const bin = path.join(home, 'fake-claude');
-  fs.writeFileSync(bin, `#!/bin/sh\n${script}`, { mode: 0o755 });
-  process.env.CCSWITCH_CLAUDE_BIN = bin;
-  return bin;
-}
 
 test('login captures a fresh account as a new profile', async (t) => {
   const { home } = sandbox(t);
@@ -686,50 +665,6 @@ test('keychainServiceFor suffixes the service with a hash of the config dir', (t
   assert.equal(keychainServiceFor(dir, config('kimi')), null);
 });
 
-// A stand-in `security` on PATH, backed by one file per service name under
-// the sandbox, so the darwin Keychain paths run against a store the test
-// controls and the real login keychain is never read, written or unlocked.
-function fakeSecurity(t, home, { lockStatus = 0 } = {}) {
-  const bin = path.join(home, 'fake-bin');
-  const store = path.join(home, 'keychain');
-  const log = path.join(home, 'security.log');
-  fs.mkdirSync(bin);
-  fs.mkdirSync(store);
-  fs.writeFileSync(
-    path.join(bin, 'security'),
-    `#!/bin/sh
-echo "$*" >> "${log}"
-cmd=$1; shift
-svc=""; want=""
-while [ $# -gt 0 ]; do case "$1" in -s) svc=$2; shift;; -w) want=1;; esac; shift; done
-case "$cmd" in
-  find-generic-password)
-    if [ -f "${store}/$svc" ]; then [ -n "$want" ] && cat "${store}/$svc"; exit 0; fi
-    echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44;;
-  delete-generic-password)
-    if [ -f "${store}/$svc" ]; then rm "${store}/$svc"; exit 0; fi
-    exit 44;;
-  show-keychain-info)
-    [ ${lockStatus} -eq 0 ] || echo "security: SecKeychainCopySettings: User interaction is not allowed." >&2
-    exit ${lockStatus};;
-esac
-exit 1
-`,
-    { mode: 0o755 },
-  );
-  const origPath = process.env.PATH;
-  process.env.PATH = `${bin}${path.delimiter}${origPath}`;
-  t.after(() => { process.env.PATH = origPath; });
-  return {
-    store,
-    put: (service, text) => fs.writeFileSync(path.join(store, service), text),
-    has: (service) => fs.existsSync(path.join(store, service)),
-    calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
-  };
-}
-
-const onDarwin = { skip: process.platform !== 'darwin' && 'Keychain paths only run on macOS' };
-
 test('materializeRunDir evicts the run dir Keychain item so claude reads the file', onDarwin, (t) => {
   const { home } = sandbox(t);
   const kc = fakeSecurity(t, home);
@@ -906,16 +841,6 @@ test('cli: encrypt via CCSWITCH_PASSPHRASE, list works, decrypt restores', (t) =
   assert.match(fs.readFileSync(path.join(cfg.home, 'profiles', 'work.json'), 'utf8'), /secret-w/);
 });
 
-const CLI = new URL('../ccswitch.mjs', import.meta.url).pathname;
-
-function runCli(args, env = {}, input) {
-  return spawnSync(process.execPath, [CLI, ...args], {
-    encoding: 'utf8',
-    env: { ...process.env, ...env },
-    input,
-  });
-}
-
 test('cli: --help prints usage and exits 0', (t) => {
   sandbox(t);
   const r = runCli(['--help']);
@@ -1020,17 +945,6 @@ test('cli: delete --dry-run deletes nothing', (t) => {
 });
 
 // --- usage command ---------------------------------------------------------------
-
-const usageCreds = (o) =>
-  JSON.stringify({ claudeAiOauth: { accessToken: 'at-1', refreshToken: 'rt-1', expiresAt: Date.now() + 60 * 60 * 1000, ...o } });
-
-function captureLog(t) {
-  const lines = [];
-  const orig = console.log;
-  console.log = (...a) => lines.push(a.join(' '));
-  t.after(() => { console.log = orig; });
-  return lines;
-}
 
 test('tokenExpired honors the 5-minute margin and fails closed', () => {
   assert.equal(tokenExpired(usageCreds()), false);
@@ -1579,14 +1493,6 @@ test('main routes export-all --move', async (t) => {
   assert.equal(await main(['export-all', out, '--move']), 0);
   assert.ok(loadProfile('work', cfg).movedAt);
 });
-
-function captureErr(t) {
-  const lines = [];
-  const orig = console.error;
-  console.error = (...a) => lines.push(a.join(' '));
-  t.after(() => { console.error = orig; });
-  return lines;
-}
 
 test('asCancel turns a readline Ctrl+C abort into a cancel and passes everything else through', () => {
   // What readline/promises actually rejects a pending question with on Ctrl+C.

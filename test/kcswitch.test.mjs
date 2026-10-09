@@ -5,42 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+import { kimiSandbox as sandbox, fakeJwt, kimiCreds, fakeKimiBin, captureLog, CLI, runCli } from './helpers.mjs';
+
 import { config, UsageError, readCredentials, writeCredentials, deleteCredentials, saveProfile, loadProfile, profileExists, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, saveBackRunDir, setPassphrase, storeEncrypted, setStoreEncryption, isEncrypted, main, tokenExpired, refreshKimiCredentials, AuthDeadError, fetchKimiUsage, parseKimiUsage, kimiWindowLabel, fetchKimiUserInfo, enrichKimiIdentity, readKimiConnection, decodeJwtPayload, kimiIdentityFromCredentials, kimiUsageCmd, usageCmd, formatCents, defaultTarget } from '../ccswitch.mjs';
-
-// Mirrors the claude suite's sandbox: all state goes to a temp dir, including
-// the kimi home (so the real ~/.kimi-code login is never touched).
-export function sandbox(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kcswitch-test-'));
-  process.env.KCSWITCH_HOME = path.join(home, 'profiles-home');
-  process.env.KCSWITCH_KIMI_HOME = path.join(home, 'kimi-home');
-  process.env.CCSWITCH_CACHE_DIR = path.join(home, 'cache');
-  for (const v of ['KIMI_CODE_HOME', 'KIMI_CODE_BASE_URL', 'KIMI_CODE_OAUTH_HOST', 'KIMI_OAUTH_HOST']) {
-    delete process.env[v];
-  }
-  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
-  return { home };
-}
-
-const b64url = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
-
-export function fakeJwt(payload) {
-  return `${b64url({ alg: 'none', typ: 'JWT' })}.${b64url(payload)}.sig`;
-}
-
-// A kimi credentials payload in the on-disk wire shape (snake_case, unix
-// seconds). expiresIn is relative to now; pass a negative value for expired.
-export function kimiCreds({ sub = 'user-1', expiresIn = 3600, accessToken, refreshToken = 'rt-1', ...rest } = {}) {
-  const now = Math.floor(Date.now() / 1000);
-  return JSON.stringify({
-    access_token: accessToken ?? fakeJwt({ sub, iat: now, exp: now + expiresIn }),
-    refresh_token: refreshToken,
-    expires_at: now + expiresIn,
-    scope: 'kimi-code',
-    token_type: 'Bearer',
-    expires_in: expiresIn,
-    ...rest,
-  });
-}
 
 const AI_CONFIG_TOML = `default_model = "kimi-code/k3"
 
@@ -71,16 +38,6 @@ function seedTwoKimiProfiles(cfg) {
   // Live state = alpha, but with a rotated token the profile file doesn't have yet.
   writeCredentials(kimiCreds({ sub: 'u-alpha', refreshToken: 'rt-a2' }), cfg);
   setActive('alpha', cfg);
-}
-
-function captureLog(t) {
-  const lines = [];
-  const orig = console.log;
-  console.log = (...a) => lines.push(a.join(' '));
-  t.after(() => {
-    console.log = orig;
-  });
-  return lines;
 }
 
 // --- config & identity ----------------------------------------------------------
@@ -263,13 +220,6 @@ test('formatList kimi shows nickname, level and moved marker', (t) => {
 });
 
 // --- Guided login ---------------------------------------------------------------
-
-export function fakeKimiBin(home, script) {
-  const bin = path.join(home, 'fake-kimi');
-  fs.writeFileSync(bin, `#!/bin/sh\n${script}`, { mode: 0o755 });
-  process.env.KCSWITCH_KIMI_BIN = bin;
-  return bin;
-}
 
 test('login kimi captures a fresh account, with region hints and /me fields', async (t) => {
   const { home } = sandbox(t);
@@ -846,15 +796,6 @@ test('the kimi store encrypts and decrypts like the claude one', (t) => {
 });
 
 // --- CLI routing ------------------------------------------------------------------
-
-const CLI = new URL('../ccswitch.mjs', import.meta.url).pathname;
-
-function runCli(args, env = {}) {
-  return spawnSync(process.execPath, [CLI, ...args], {
-    encoding: 'utf8',
-    env: { ...process.env, ...env },
-  });
-}
 
 function kimiEnv() {
   return {

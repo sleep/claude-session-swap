@@ -150,6 +150,98 @@ export interface KimiWindow {
   unit: 'minute' | 'hour' | 'day' | 'week';
 }
 
+// A profile as list/usage report it: the identity fields, never the credentials.
+export interface ProfileSummary {
+  name: string;
+  active: boolean;
+  moved: boolean;
+  account: string | null;
+  tier: string | null;
+  accountId: string | null;
+  subscriptionType: string | null;
+  tokenExpiresAt: string | null;
+  savedAt: string | null;
+}
+
+export interface ProfileRecord<U = Usage> extends ProfileSummary {
+  usage: U | null;
+  cachedAt: number | null;
+  state: Status;
+}
+
+export interface ProfileList {
+  target: Target;
+  active: string | null;
+  profiles: ProfileSummary[];
+}
+
+export interface UsageReport<U = Usage> {
+  target: Target;
+  active: string | null;
+  fetchedAt: number;
+  profiles: ProfileRecord<U>[];
+}
+
+export interface LiveIdentity {
+  loggedIn: boolean;
+  account: string | null;
+  tier: string | null;
+  accountId: string | null;
+  subscriptionType: string | null;
+  rateLimitTier: string | null;
+  tokenExpiresAt: string | null;
+  profile: string | null;
+}
+
+export interface LiveUsage<U = Usage> {
+  usage: U | null;
+  cachedAt: number | null;
+  state: Status;
+}
+
+// A materialized run dir plus what to spawn: spread env over the child's
+// environment and call finish() after it exits to save rotated tokens back.
+export interface RunHandle {
+  bin: string;
+  dir: string;
+  env: Record<string, string>;
+  profile: { name: string; account: string | null; tier: string | null };
+  finish(): { savedBack: boolean };
+}
+
+export interface KeychainEntryReport {
+  name: string;
+  service: string;
+  present: boolean | null;
+}
+
+export interface KeychainReport {
+  available: boolean;
+  locked: boolean | null;
+  lockProbeStatus: number | null;
+  defaultEntry: { service: string; present: boolean | null } | null;
+  runDirEntries: KeychainEntryReport[];
+}
+
+export interface DoctorReport {
+  target: Target;
+  platform: string;
+  node: string;
+  bin: { name: string; found: string | null };
+  store: {
+    home: string;
+    exists: boolean;
+    encrypted: boolean;
+    readable: boolean;
+    profiles: string[] | null;
+    active: string | null;
+    runDirs: string[];
+  };
+  credentialsFile: { path: string; present: boolean };
+  live: LiveIdentity;
+  keychain: KeychainReport | null;
+}
+
 // Anything shaped like fetch; tests pass fakes returning only these fields.
 export type FetchImpl = (url: string, init?: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'json'>>;
 
@@ -228,6 +320,7 @@ export function importAll(src: string | undefined, opts?: { force?: boolean; dry
 
 export function materializeRunDir(name: string, cfg?: Config): string;
 export function saveBackRunDir(name: string, dir: string, cfg?: Config): boolean;
+export function prepareRun(name: string, cfg?: Config): RunHandle;
 export function runProfile(name: string, toolArgs: string[], cfg?: Config): number;
 
 export function writeUsageCache(name: string, usage: Usage, cfg?: Config, now?: number): void;
@@ -257,8 +350,17 @@ export function formatStatus(status: Status, opts?: { color?: boolean; now?: num
 export function formatResetIn(resetsAt: string | null, now?: number): string;
 export function renderTable(header: string[], rows: string[][], maxWidth?: number): string;
 export function shouldUseColor(env?: Record<string, string | undefined>): boolean;
-export function usageCmd(opts?: { dryRun?: boolean }, cfg?: Config, fetchImpl?: FetchImpl): Promise<number>;
-export function kimiUsageCmd(opts?: { dryRun?: boolean }, cfg?: KimiConfig, fetchImpl?: FetchImpl): Promise<number>;
+export function listProfileRecords(cfg?: Config): ProfileList;
+export function listProfilesWithUsage(opts: { refresh?: boolean }, cfg: ClaudeConfig, fetchImpl?: FetchImpl): Promise<UsageReport<ClaudeUsage>>;
+export function listProfilesWithUsage(opts: { refresh?: boolean }, cfg: KimiConfig, fetchImpl?: FetchImpl): Promise<UsageReport<KimiUsage>>;
+export function listProfilesWithUsage(opts?: { refresh?: boolean }, cfg?: Config, fetchImpl?: FetchImpl): Promise<UsageReport>;
+export function liveIdentity(cfg?: Config): LiveIdentity;
+export function liveUsage(opts: { refresh?: boolean }, cfg: ClaudeConfig, fetchImpl?: FetchImpl): Promise<LiveUsage<ClaudeUsage>>;
+export function liveUsage(opts: { refresh?: boolean }, cfg: KimiConfig, fetchImpl?: FetchImpl): Promise<LiveUsage<KimiUsage>>;
+export function liveUsage(opts?: { refresh?: boolean }, cfg?: Config, fetchImpl?: FetchImpl): Promise<LiveUsage>;
+export function usageCmd(opts?: { dryRun?: boolean; json?: boolean; cached?: boolean }, cfg?: Config, fetchImpl?: FetchImpl): Promise<number>;
+export function kimiUsageCmd(opts?: { dryRun?: boolean; json?: boolean; cached?: boolean }, cfg?: KimiConfig, fetchImpl?: FetchImpl): Promise<number>;
+export function doctor(cfg?: Config): DoctorReport;
 
 export function main(argv?: string[]): Promise<number>;
 export function reportFatal(err: unknown): number;

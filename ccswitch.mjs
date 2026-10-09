@@ -1101,6 +1101,10 @@ function readRunDir(dir, cfg) {
 }
 
 export function materializeRunDir(name, cfg = config()) {
+  return materializeRun(name, cfg).dir;
+}
+
+function materializeRun(name, cfg) {
   const profile = loadProfile(name, cfg);
   assertNotMoved(name, profile, cfg);
   const dir = runDirPath(name, cfg);
@@ -1135,7 +1139,7 @@ export function materializeRunDir(name, cfg = config()) {
         { mode: 0o600 },
       );
     }
-    return dir;
+    return { dir, profile };
   }
   fs.writeFileSync(path.join(dir, '.credentials.json'), profile.credentials ?? '', { mode: 0o600 });
   const cjPath = path.join(dir, '.claude.json');
@@ -1150,7 +1154,7 @@ export function materializeRunDir(name, cfg = config()) {
   if (cj.hasCompletedOnboarding === undefined) cj.hasCompletedOnboarding = true;
   cj.oauthAccount = profile.oauthAccount;
   fs.writeFileSync(cjPath, JSON.stringify(cj, null, 2), { mode: 0o600 });
-  return dir;
+  return { dir, profile };
 }
 
 // OAuth refresh tokens are single-use: once the session refreshes, the
@@ -1170,14 +1174,25 @@ export function saveBackRunDir(name, dir, cfg = config()) {
   return true;
 }
 
+// Everything runProfile does around the spawn, without the spawn, for callers
+// that start the tool themselves (a pty, a service): spread env over the
+// child's environment and call finish() once it has exited.
+export function prepareRun(name, cfg = config()) {
+  const { dir, profile } = materializeRun(name, cfg);
+  return {
+    bin: cfg.bin,
+    dir,
+    env: { [cfg.runEnvVar]: dir },
+    profile: { name, account: displayAccount(profile.oauthAccount), tier: displayTier(profile.oauthAccount) },
+    finish: () => ({ savedBack: saveBackRunDir(name, dir, cfg) }),
+  };
+}
+
 export function runProfile(name, toolArgs, cfg = config()) {
-  const dir = materializeRunDir(name, cfg);
-  const r = spawnSync(cfg.bin, toolArgs, {
-    stdio: 'inherit',
-    env: { ...process.env, [cfg.runEnvVar]: dir },
-  });
+  const run = prepareRun(name, cfg);
+  const r = spawnSync(run.bin, toolArgs, { stdio: 'inherit', env: { ...process.env, ...run.env } });
   if (r.error) throw r.error;
-  saveBackRunDir(name, dir, cfg);
+  run.finish();
   return r.status ?? 1;
 }
 
@@ -1623,28 +1638,77 @@ export function shouldUseColor(env = process.env) {
   return true;
 }
 
-const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', STATUS_LABEL];
+// --- Profile records (plain data behind list/usage) ------------------------------
+// Everything list and usage know about a profile except its secrets: the
+// shape the --json commands print and library callers render themselves.
+
+function nullableExpiry(credentials) {
+  const iso = tokenExpiry(credentials);
+  return iso === '-' ? null : iso;
+}
+
+function claudeOauth(credentials) {
+  try {
+    return JSON.parse(credentials)?.claudeAiOauth ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function profileRecord(p, active) {
+  return {
+    name: p.name,
+    active: p.name === active,
+    moved: !!p.movedAt,
+    account: displayAccount(p.oauthAccount),
+    tier: displayTier(p.oauthAccount),
+    accountId: identityKey(p.oauthAccount),
+    subscriptionType: claudeOauth(p.credentials)?.subscriptionType ?? null,
+    tokenExpiresAt: nullableExpiry(p.credentials),
+    savedAt: p.savedAt ?? null,
+  };
+}
+
+export function listProfileRecords(cfg = config()) {
+  const active = getActive(cfg);
+  return { target: cfg.target, active, profiles: listProfiles(cfg).map((p) => profileRecord(p, active)) };
+}
+
+// Cache-only answer for a record: no token refresh, no network. "no cached
+// usage" is an error state rather than an empty success so a UI painting from
+// the cache can tell "nothing known yet" from "the account has no limits".
+function fromUsageCache(rec, name, cfg) {
+  const cached = readUsageCache(name, cfg);
+  if (!cached) return { ...rec, state: { kind: 'error', message: 'no cached usage' } };
+  return { ...rec, usage: cached.usage, cachedAt: cached.fetchedAt, state: { kind: 'cached', at: cached.fetchedAt } };
+}
+
+function failedState(err) {
+  return err instanceof AuthDeadError ? { kind: 'dead' } : { kind: 'error', message: err.message };
+}
+
+const SUCCEEDED = new Set(['ok', 'cached']);
 
 // Shared by usageCmd (prints the table as-is) and pickProfile (adds a "#"
 // column and prompts for a selection), so the picker's per-account limits
 // stay driven by the exact same fetch/refresh/error logic as `usage`.
-async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
-  const rows = [];
-  let succeeded = 0;
+async function claudeUsageRecords(profiles, active, cfg, fetchImpl, { refresh = true } = {}) {
+  const records = [];
   for (const p of profiles) {
     const isActive = p.name === active;
+    const rec = { ...profileRecord(p, active), usage: null, cachedAt: null, state: { kind: 'ok' } };
     if (p.movedAt) {
       // The chain rotates on another machine now; refreshing it from here
       // would revoke it there.
-      rows.push([
-        isActive ? '*' : ' ', p.name, p.oauthAccount?.emailAddress ?? '-', '-', '-', '-', '-', '-', '-',
-        formatStatus({ kind: 'moved' }, { color }),
-      ]);
+      records.push({ ...rec, state: { kind: 'moved' } });
+      continue;
+    }
+    if (!refresh) {
+      records.push(fromUsageCache(rec, p.name, cfg));
       continue;
     }
     let credentials = freshestCredentials(p, isActive, cfg);
-    let status = { kind: 'ok' };
-    let usage = null;
+    rec.tokenExpiresAt = nullableExpiry(credentials);
     try {
       if (!credentials) throw new AuthDeadError('no credentials stored');
       if (tokenExpired(credentials)) {
@@ -1652,76 +1716,41 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
         // Persist-before-use: the rotated chain reaches disk before anything
         // can go wrong with the usage call (or the process).
         persistRefreshed(p.name, credentials, p.oauthAccount, isActive, cfg);
+        rec.tokenExpiresAt = nullableExpiry(credentials);
       }
+      rec.subscriptionType = claudeOauth(credentials)?.subscriptionType ?? rec.subscriptionType;
       const got = await usageWithCache(p.name, cfg, () => fetchUsage(credentials, fetchImpl));
-      usage = got.usage;
-      if (got.cachedAt) status = { kind: 'cached', at: got.cachedAt };
-      succeeded++;
+      rec.usage = got.usage;
+      if (got.cachedAt) {
+        rec.cachedAt = got.cachedAt;
+        rec.state = { kind: 'cached', at: got.cachedAt };
+      }
     } catch (err) {
-      status = err instanceof AuthDeadError ? { kind: 'dead' } : { kind: 'error', message: err.message };
+      rec.state = failedState(err);
     }
-    rows.push([
-      isActive ? '*' : ' ',
-      p.name,
-      p.oauthAccount?.emailAddress ?? '-',
-      usage ? formatBar(usage.fiveHour?.utilization ?? null, { color }) : '-',
-      usage ? formatResetIn(usage.fiveHour?.resetsAt ?? null) : '-',
-      usage ? formatBar(usage.sevenDay?.utilization ?? null, { color }) : '-',
-      usage ? formatResetIn(usage.sevenDay?.resetsAt ?? null) : '-',
-      usage ? formatBar(usage.fable?.utilization ?? null, { color }) : '-',
-      usage ? formatResetIn(usage.fable?.resetsAt ?? null) : '-',
-      formatStatus(status, { color }),
-    ]);
+    records.push(rec);
   }
-  return { header: CLAUDE_USAGE_HEADER, rows, succeeded };
+  return records;
 }
-
-export async function usageCmd({ dryRun = false } = {}, cfg = config(), fetchImpl = fetch) {
-  if (cfg.target === 'kimi') return kimiUsageCmd({ dryRun }, cfg, fetchImpl);
-  const profiles = listProfiles(cfg);
-  if (profiles.length === 0) {
-    console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
-    return 0;
-  }
-  const active = getActive(cfg);
-  if (dryRun) {
-    for (const p of profiles) {
-      const credentials = p.name === active ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
-      console.log(
-        `[dry-run] would query usage for "${p.name}"${tokenExpired(credentials) ? ' (needs token refresh first)' : ''}`,
-      );
-    }
-    return 0;
-  }
-  const { header, rows, succeeded } = await claudeUsageRows(profiles, active, cfg, fetchImpl, shouldUseColor());
-  console.log(renderTable(header, rows, terminalWidth()));
-  return succeeded > 0 ? 0 : 1;
-}
-
-const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', STATUS_LABEL];
 
 // Kimi's /usages shape differs from claude's: a weekly summary row, extra
-// scoped limit windows, and a booster wallet balance. Columns follow suit.
-// Shared by kimiUsageCmd and pickProfile, same reason as claudeUsageRows above.
-async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
-  const rows = [];
-  let succeeded = 0;
+// scoped limit windows, and a booster wallet balance. Same loop otherwise.
+async function kimiUsageRecords(profiles, active, cfg, fetchImpl, { refresh = true } = {}) {
+  const records = [];
   for (const p of profiles) {
     const isActive = p.name === active;
-    let account = displayAccount(p.oauthAccount) ?? '-';
+    const rec = { ...profileRecord(p, active), usage: null, cachedAt: null, state: { kind: 'ok' } };
     if (p.movedAt) {
-      // The chain rotates on another machine now; refreshing it from here
-      // would revoke it there.
-      rows.push([
-        isActive ? '*' : ' ', p.name, account, '-', '-', '-', '-',
-        formatStatus({ kind: 'moved' }, { color }),
-      ]);
+      records.push({ ...rec, state: { kind: 'moved' } });
+      continue;
+    }
+    if (!refresh) {
+      records.push(fromUsageCache(rec, p.name, cfg));
       continue;
     }
     let credentials = freshestCredentials(p, isActive, cfg);
     let oauthAccount = p.oauthAccount;
-    let status = { kind: 'ok' };
-    let usage = null;
+    rec.tokenExpiresAt = nullableExpiry(credentials);
     try {
       if (!credentials) throw new AuthDeadError('no credentials stored');
       if (tokenExpired(credentials)) {
@@ -1729,12 +1758,15 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
         // Persist-before-use: the rotated chain reaches disk before anything
         // can go wrong with the usage call (or the process).
         persistRefreshed(p.name, credentials, oauthAccount, isActive, cfg);
+        rec.tokenExpiresAt = nullableExpiry(credentials);
       }
       const baseUrl = oauthAccount?.baseUrl ?? readKimiConnection(cfg).baseUrl;
       const got = await usageWithCache(p.name, cfg, () => fetchKimiUsage(credentials, fetchImpl, { baseUrl }));
-      usage = got.usage;
-      if (got.cachedAt) status = { kind: 'cached', at: got.cachedAt };
-      succeeded++;
+      rec.usage = got.usage;
+      if (got.cachedAt) {
+        rec.cachedAt = got.cachedAt;
+        rec.state = { kind: 'cached', at: got.cachedAt };
+      }
       // Best-effort: cache the account's display fields into the profile so
       // list/usage show a nickname instead of a bare user id.
       const me = await fetchKimiUserInfo(baseUrl, JSON.parse(credentials).access_token, fetchImpl);
@@ -1746,33 +1778,153 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
         if (Object.keys(add).length > 0 || !oauthAccount?.userId) {
           oauthAccount = { ...oauthAccount, userId: oauthAccount?.userId ?? me.userId, ...add };
           saveProfile(p.name, { credentials, oauthAccount }, cfg);
-          account = displayAccount(oauthAccount) ?? account;
+          rec.account = displayAccount(oauthAccount);
+          rec.tier = displayTier(oauthAccount);
+          rec.accountId = identityKey(oauthAccount);
         }
       }
     } catch (err) {
-      status = err instanceof AuthDeadError ? { kind: 'dead' } : { kind: 'error', message: err.message };
+      rec.state = failedState(err);
     }
-    rows.push([
-      isActive ? '*' : ' ',
-      p.name,
-      account,
-      usage?.summary ? formatBar(usage.summary.utilization, { color }) : '-',
-      usage?.summary ? formatResetIn(usage.summary.resetsAt) : '-',
-      usage
-        ? usage.limits.length
-          ? usage.limits
-              .map((l) => `${l.label ?? l.name} ${formatBar(l.utilization, { color })} ${formatResetIn(l.resetsAt)}`)
-              .join('  ')
-          : '-'
-        : '-',
-      usage?.booster ? formatCents(usage.booster.balanceCents, usage.booster.currency) : '-',
-      formatStatus(status, { color }),
-    ]);
+    records.push(rec);
   }
-  return { header: KIMI_USAGE_HEADER, rows, succeeded };
+  return records;
 }
 
-export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi'), fetchImpl = fetch) {
+export async function listProfilesWithUsage({ refresh = true } = {}, cfg = config(), fetchImpl = fetch) {
+  const profiles = listProfiles(cfg);
+  const active = getActive(cfg);
+  const build = cfg.target === 'kimi' ? kimiUsageRecords : claudeUsageRecords;
+  return { target: cfg.target, active, fetchedAt: Date.now(), profiles: await build(profiles, active, cfg, fetchImpl, { refresh }) };
+}
+
+// --- The live login ----------------------------------------------------------------
+// The login currently in ~/.claude (or ~/.kimi-code), whether or not any
+// profile holds it. Nothing here returns the credentials themselves.
+
+function identityFrom(live, profiles, active, cfg) {
+  const key = identityKey(live.oauthAccount);
+  // The active profile is the expected owner; it wins over any copy of the
+  // same account saved under another name.
+  const ordered = [...profiles.filter((p) => p.name === active), ...profiles.filter((p) => p.name !== active)];
+  const match = key ? ordered.find((p) => identityKey(p.oauthAccount) === key) ?? null : null;
+  // A kimi profile carries /me display fields the bare token cannot provide.
+  const account = live.credentials ? { ...(match?.oauthAccount ?? {}), ...(live.oauthAccount ?? {}) } : null;
+  const oauth = cfg.target === 'kimi' ? null : claudeOauth(live.credentials);
+  return {
+    loggedIn: !!live.credentials,
+    account: displayAccount(account),
+    tier: displayTier(account),
+    accountId: identityKey(account),
+    subscriptionType: oauth?.subscriptionType ?? null,
+    rateLimitTier: oauth?.rateLimitTier ?? null,
+    tokenExpiresAt: nullableExpiry(live.credentials),
+    profile: match?.name ?? null,
+  };
+}
+
+export function liveIdentity(cfg = config()) {
+  return identityFrom(captureLive(cfg), listProfiles(cfg), getActive(cfg), cfg);
+}
+
+// A leading dot cannot collide with a profile's cache file: validateName
+// forbids it in profile names.
+const LIVE_USAGE_CACHE = '.live';
+
+export async function liveUsage({ refresh = true } = {}, cfg = config(), fetchImpl = fetch) {
+  const out = { usage: null, cachedAt: null, state: { kind: 'ok' } };
+  if (!refresh) return fromUsageCache(out, LIVE_USAGE_CACHE, cfg);
+  const live = captureLive(cfg);
+  let credentials = live.credentials;
+  try {
+    if (!credentials) throw new AuthDeadError('no live login');
+    if (tokenExpired(credentials)) {
+      credentials =
+        cfg.target === 'kimi'
+          ? await refreshKimiCredentials(credentials, fetchImpl, { oauthHost: readKimiConnection(cfg).oauthHost })
+          : await refreshCredentials(credentials, fetchImpl);
+      // Persist-before-use, into the live store and into the active profile
+      // when the login is its own (the same save-back a switch would do).
+      writeCredentials(credentials, cfg);
+      const active = getActive(cfg);
+      if (active && profileExists(active, cfg)) {
+        const p = loadProfile(active, cfg);
+        if (sameAccount(live.oauthAccount, p.oauthAccount)) {
+          saveProfile(active, { credentials, oauthAccount: p.oauthAccount }, cfg);
+        }
+      }
+    }
+    const got = await usageWithCache(LIVE_USAGE_CACHE, cfg, () =>
+      cfg.target === 'kimi'
+        ? fetchKimiUsage(credentials, fetchImpl, { baseUrl: readKimiConnection(cfg).baseUrl })
+        : fetchUsage(credentials, fetchImpl),
+    );
+    out.usage = got.usage;
+    if (got.cachedAt) {
+      out.cachedAt = got.cachedAt;
+      out.state = { kind: 'cached', at: got.cachedAt };
+    }
+  } catch (err) {
+    out.state = failedState(err);
+  }
+  return out;
+}
+
+// --- Usage tables -----------------------------------------------------------------
+
+const CLAUDE_USAGE_HEADER = [' ', 'name', 'email', '5h', 'resets', '7d', 'resets', 'fable', 'resets', STATUS_LABEL];
+const KIMI_USAGE_HEADER = [' ', 'name', 'account', 'week', 'resets', 'limits', 'booster', STATUS_LABEL];
+
+function claudeUsageCells(r, color) {
+  const u = r.usage;
+  return [
+    r.active ? '*' : ' ',
+    r.name,
+    r.account ?? '-',
+    u ? formatBar(u.fiveHour?.utilization ?? null, { color }) : '-',
+    u ? formatResetIn(u.fiveHour?.resetsAt ?? null) : '-',
+    u ? formatBar(u.sevenDay?.utilization ?? null, { color }) : '-',
+    u ? formatResetIn(u.sevenDay?.resetsAt ?? null) : '-',
+    u ? formatBar(u.fable?.utilization ?? null, { color }) : '-',
+    u ? formatResetIn(u.fable?.resetsAt ?? null) : '-',
+    formatStatus(r.state, { color }),
+  ];
+}
+
+function kimiUsageCells(r, color) {
+  const u = r.usage;
+  return [
+    r.active ? '*' : ' ',
+    r.name,
+    r.account ?? '-',
+    u?.summary ? formatBar(u.summary.utilization, { color }) : '-',
+    u?.summary ? formatResetIn(u.summary.resetsAt) : '-',
+    u
+      ? u.limits.length
+        ? u.limits.map((l) => `${l.label ?? l.name} ${formatBar(l.utilization, { color })} ${formatResetIn(l.resetsAt)}`).join('  ')
+        : '-'
+      : '-',
+    u?.booster ? formatCents(u.booster.balanceCents, u.booster.currency) : '-',
+    formatStatus(r.state, { color }),
+  ];
+}
+
+async function usageRows(profiles, active, cfg, fetchImpl, color) {
+  const kimi = cfg.target === 'kimi';
+  const records = await (kimi ? kimiUsageRecords : claudeUsageRecords)(profiles, active, cfg, fetchImpl);
+  return {
+    header: kimi ? KIMI_USAGE_HEADER : CLAUDE_USAGE_HEADER,
+    rows: records.map((r) => (kimi ? kimiUsageCells : claudeUsageCells)(r, color)),
+    succeeded: records.filter((r) => SUCCEEDED.has(r.state.kind)).length,
+  };
+}
+
+export async function usageCmd({ dryRun = false, json = false, cached = false } = {}, cfg = config(), fetchImpl = fetch) {
+  if (json) {
+    const report = await listProfilesWithUsage({ refresh: !cached }, cfg, fetchImpl);
+    console.log(JSON.stringify(report, null, 2));
+    return report.profiles.length === 0 || report.profiles.some((r) => SUCCEEDED.has(r.state.kind)) ? 0 : 1;
+  }
   const profiles = listProfiles(cfg);
   if (profiles.length === 0) {
     console.log(`no profiles yet — save your current login with "${cfg.prog} save <name>"`);
@@ -1788,9 +1940,109 @@ export async function kimiUsageCmd({ dryRun = false } = {}, cfg = config('kimi')
     }
     return 0;
   }
-  const { header, rows, succeeded } = await kimiUsageRows(profiles, active, cfg, fetchImpl, shouldUseColor());
+  const { header, rows, succeeded } = await usageRows(profiles, active, cfg, fetchImpl, shouldUseColor());
   console.log(renderTable(header, rows, terminalWidth()));
   return succeeded > 0 ? 0 : 1;
+}
+
+export async function kimiUsageCmd(opts = {}, cfg = config('kimi'), fetchImpl = fetch) {
+  return usageCmd(opts, cfg, fetchImpl);
+}
+
+// --- Doctor -----------------------------------------------------------------------
+// Plain facts about the setup, for a human or a program to judge: where the
+// tool, store and live login are, and (macOS) what the Keychain holds and
+// whether it is reachable. Nothing here prints, prompts, unlocks or writes.
+
+function findOnPath(bin) {
+  if (bin.includes('/')) return fs.existsSync(bin) ? path.resolve(bin) : null;
+  for (const d of (process.env.PATH ?? '').split(path.delimiter)) {
+    if (!d) continue;
+    const full = path.join(d, bin);
+    try {
+      fs.accessSync(full, fs.constants.X_OK);
+      if (fs.statSync(full).isFile()) return full;
+    } catch {}
+  }
+  return null;
+}
+
+function listRunDirs(cfg) {
+  try {
+    return fs
+      .readdirSync(path.join(cfg.home, 'dirs'), { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+}
+
+// Presence only: no -w, so the secret never reaches a pipe. true/false for a
+// definite answer, null when the Keychain would not say (locked, no UI).
+function keychainEntryPresent(service) {
+  const r = spawnSync('security', ['find-generic-password', '-s', service], { encoding: 'utf8' });
+  if (r.error) return null;
+  if (r.status === 0) return true;
+  if (r.status === 44) return false;
+  return null;
+}
+
+const LOGIN_KEYCHAIN = path.join(os.homedir(), 'Library', 'Keychains', 'login.keychain-db');
+
+function keychainReport(cfg, runDirs) {
+  if (!cfg.keychainService || process.platform !== 'darwin') return null;
+  const probe = spawnSync('security', ['show-keychain-info', LOGIN_KEYCHAIN], { encoding: 'utf8' });
+  if (probe.error) {
+    return { available: false, locked: null, lockProbeStatus: null, defaultEntry: null, runDirEntries: [] };
+  }
+  // Exit 0 means the settings were readable, i.e. the keychain is unlocked.
+  // Exit 36, or the interaction refusal, is what a locked keychain answers
+  // with when no UI can prompt for its password (ssh, launchd).
+  const locked =
+    probe.status === 0 ? false : probe.status === 36 || /User interaction is not allowed/.test(probe.stderr ?? '') ? true : null;
+  return {
+    available: true,
+    locked,
+    lockProbeStatus: probe.status,
+    defaultEntry: { service: cfg.keychainService, present: keychainEntryPresent(cfg.keychainService) },
+    runDirEntries: runDirs.map((name) => {
+      const service = keychainServiceFor(runDirPath(name, cfg), cfg);
+      return { name, service, present: keychainEntryPresent(service) };
+    }),
+  };
+}
+
+export function doctor(cfg = config()) {
+  const active = getActive(cfg);
+  const encrypted = storeEncrypted(cfg);
+  let profiles = null;
+  try {
+    profiles = listProfiles(cfg);
+  } catch (err) {
+    if (!(err instanceof UsageError)) throw err; // only a sealed store without a passphrase is a finding
+  }
+  const runDirs = listRunDirs(cfg);
+  return {
+    target: cfg.target,
+    platform: process.platform,
+    node: process.version,
+    bin: { name: cfg.bin, found: findOnPath(cfg.bin) },
+    store: {
+      home: cfg.home,
+      exists: fs.existsSync(cfg.home),
+      encrypted,
+      readable: profiles !== null,
+      profiles: profiles?.map((p) => p.name) ?? null,
+      active,
+      runDirs,
+    },
+    credentialsFile: { path: cfg.credentialsFile, present: fs.existsSync(cfg.credentialsFile) },
+    live: identityFrom(captureLive(cfg), profiles ?? [], active, cfg),
+    keychain: keychainReport(cfg, runDirs),
+  };
 }
 
 // --- CLI --------------------------------------------------------------------------
@@ -1950,8 +2202,7 @@ async function pickProfile(cfg, { dryRun = false } = {}, fetchImpl = fetch) {
     header = [' ', 'name', 'account'];
     rows = profiles.map((p) => [p.name === active ? '*' : ' ', p.name, displayAccount(p.oauthAccount) ?? '-']);
   } else {
-    const rowsFn = cfg.target === 'kimi' ? kimiUsageRows : claudeUsageRows;
-    ({ header, rows } = await rowsFn(profiles, active, cfg, fetchImpl, shouldUseColor()));
+    ({ header, rows } = await usageRows(profiles, active, cfg, fetchImpl, shouldUseColor()));
   }
   const idx = await pickIndex(header, rows, activeIdx);
   return profiles[idx].name;

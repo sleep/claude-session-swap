@@ -1634,7 +1634,7 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
       succeeded++;
       // Best-effort: cache the account's display fields into the profile so
       // list/usage show a nickname instead of a bare user id.
-      const me = await fetchKimiUserInfo(baseUrl, JSON.parse(credentials).accessToken, fetchImpl);
+      const me = await fetchKimiUserInfo(baseUrl, JSON.parse(credentials).access_token, fetchImpl);
       if (me) {
         const add = {};
         if (!oauthAccount?.nickname && me.nickname) add.nickname = me.nickname;

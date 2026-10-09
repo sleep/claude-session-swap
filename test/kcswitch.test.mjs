@@ -645,6 +645,7 @@ test('kimiUsageCmd refreshes expired tokens, persists before the usage call, enr
       };
     }
     if (url.endsWith('/me')) {
+      assert.equal(init.headers.Authorization, `Bearer ${newToken}`);
       return { ok: true, status: 200, json: async () => ({ user_id: 'u-1', nickname: 'Shy', user_level_name: 'Pro' }) };
     }
     throw new Error(`unexpected url ${url}`);
@@ -661,6 +662,26 @@ test('kimiUsageCmd refreshes expired tokens, persists before the usage call, enr
   // /me enrichment landed in the profile and the rendered row:
   assert.equal(loadProfile('work', cfg).oauthAccount.nickname, 'Shy');
   assert.match(out, /work +Shy/);
+});
+
+test('kimiUsageCmd authenticates the /me lookup with the kimi access token', async (t) => {
+  sandbox(t);
+  const cfg = config('kimi');
+  const token = fakeJwt({ sub: 'u-1' });
+  saveProfile('work', { credentials: kimiCreds({ sub: 'u-1', accessToken: token }), oauthAccount: { userId: 'u-1' } }, cfg);
+  // Kimi credentials are snake_case on the wire; a claude-style field name
+  // would send "Bearer undefined" and /me would answer 401.
+  const fetchImpl = async (url, init) => {
+    if (url.endsWith('/usages')) return { ok: true, status: 200, json: async () => ({ usage: { used: 1, limit: 10 } }) };
+    if (url.endsWith('/me')) {
+      if (init.headers.Authorization !== `Bearer ${token}`) return { ok: false, status: 401 };
+      return { ok: true, status: 200, json: async () => ({ user_id: 'u-1', nickname: 'Shy' }) };
+    }
+    throw new Error(`unexpected url ${url}`);
+  };
+  captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.equal(loadProfile('work', cfg).oauthAccount.nickname, 'Shy');
 });
 
 test('kimiUsageCmd uses live credentials for the active profile without refreshing', async (t) => {

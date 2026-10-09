@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo, formatStatus } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo, formatStatus, keychainServiceFor } from '../ccswitch.mjs';
 
 // Every test calls sandbox(t) first: all ccswitch state goes to a temp dir,
 // including the credentials file, so the suite runs on any platform and the
@@ -673,6 +674,133 @@ test('saveBackRunDir skips a mismatched account and an empty run dir', (t) => {
   fs.rmSync(path.join(dir, '.credentials.json'));
   saveBackRunDir('work', dir, cfg);
   assert.equal(loadProfile('work', cfg).credentials, '{"tok":"w"}');
+});
+
+test('keychainServiceFor suffixes the service with a hash of the config dir', (t) => {
+  sandbox(t);
+  const cfg = config();
+  const dir = path.join(cfg.home, 'dirs', 'work');
+  const hash = crypto.createHash('sha256').update(dir).digest('hex').slice(0, 8);
+  assert.equal(keychainServiceFor(dir, cfg), `${cfg.keychainService}-${hash}`);
+  assert.equal(keychainServiceFor(path.join(os.homedir(), '.claude'), cfg), cfg.keychainService);
+  assert.equal(keychainServiceFor(dir, config('kimi')), null);
+});
+
+// A stand-in `security` on PATH, backed by one file per service name under
+// the sandbox, so the darwin Keychain paths run against a store the test
+// controls and the real login keychain is never read, written or unlocked.
+function fakeSecurity(t, home, { lockStatus = 0 } = {}) {
+  const bin = path.join(home, 'fake-bin');
+  const store = path.join(home, 'keychain');
+  const log = path.join(home, 'security.log');
+  fs.mkdirSync(bin);
+  fs.mkdirSync(store);
+  fs.writeFileSync(
+    path.join(bin, 'security'),
+    `#!/bin/sh
+echo "$*" >> "${log}"
+cmd=$1; shift
+svc=""; want=""
+while [ $# -gt 0 ]; do case "$1" in -s) svc=$2; shift;; -w) want=1;; esac; shift; done
+case "$cmd" in
+  find-generic-password)
+    if [ -f "${store}/$svc" ]; then [ -n "$want" ] && cat "${store}/$svc"; exit 0; fi
+    echo "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain." >&2; exit 44;;
+  delete-generic-password)
+    if [ -f "${store}/$svc" ]; then rm "${store}/$svc"; exit 0; fi
+    exit 44;;
+  show-keychain-info)
+    [ ${lockStatus} -eq 0 ] || echo "security: SecKeychainCopySettings: User interaction is not allowed." >&2
+    exit ${lockStatus};;
+esac
+exit 1
+`,
+    { mode: 0o755 },
+  );
+  const origPath = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${origPath}`;
+  t.after(() => { process.env.PATH = origPath; });
+  return {
+    store,
+    put: (service, text) => fs.writeFileSync(path.join(store, service), text),
+    has: (service) => fs.existsSync(path.join(store, service)),
+    calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []),
+  };
+}
+
+const onDarwin = { skip: process.platform !== 'darwin' && 'Keychain paths only run on macOS' };
+
+test('materializeRunDir evicts the run dir Keychain item so claude reads the file', onDarwin, (t) => {
+  const { home } = sandbox(t);
+  const kc = fakeSecurity(t, home);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds({ expiresAt: 2000 }), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const dir = path.join(cfg.home, 'dirs', 'work');
+  const service = keychainServiceFor(dir, cfg);
+  // A stale item from an earlier session, older than the profile snapshot:
+  fs.mkdirSync(dir, { recursive: true });
+  kc.put(service, usageCreds({ accessToken: 'at-stale', expiresAt: 1000 }));
+
+  materializeRunDir('work', cfg);
+
+  assert.equal(kc.has(service), false);
+  assert.ok(kc.calls().some((c) => c === `delete-generic-password -s ${service}`));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, 'at-1');
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.accessToken, 'at-1');
+});
+
+test('materializeRunDir adopts a newer chain a crashed session left in the Keychain', onDarwin, (t) => {
+  const { home } = sandbox(t);
+  const kc = fakeSecurity(t, home);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds({ expiresAt: 1000 }), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const dir = path.join(cfg.home, 'dirs', 'work');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'w@x.com' } }));
+  kc.put(keychainServiceFor(dir, cfg), usageCreds({ accessToken: 'at-kc', expiresAt: 3000 }));
+
+  materializeRunDir('work', cfg);
+
+  // The snapshot's refresh token died when the session rotated it; both the
+  // profile and the run dir now carry the chain that is still alive.
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.accessToken, 'at-kc');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth.accessToken, 'at-kc');
+  assert.equal(kc.has(keychainServiceFor(dir, cfg)), false);
+});
+
+test('saveBackRunDir prefers a newer Keychain item over the run dir file and evicts it', onDarwin, (t) => {
+  const { home } = sandbox(t);
+  const kc = fakeSecurity(t, home);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds({ expiresAt: 1000 }), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const dir = materializeRunDir('work', cfg);
+  const service = keychainServiceFor(dir, cfg);
+  kc.put(service, usageCreds({ accessToken: 'at-kc', refreshToken: 'rt-kc', expiresAt: 5000 }));
+
+  assert.equal(saveBackRunDir('work', dir, cfg), true);
+
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.refreshToken, 'rt-kc');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth.refreshToken, 'rt-kc');
+  assert.equal(kc.has(service), false);
+
+  // An older item is evicted as stale but never wins over the file.
+  fs.writeFileSync(path.join(dir, '.credentials.json'), usageCreds({ refreshToken: 'rt-file', expiresAt: 9000 }));
+  kc.put(service, usageCreds({ refreshToken: 'rt-old', expiresAt: 100 }));
+  assert.equal(saveBackRunDir('work', dir, cfg), true);
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.refreshToken, 'rt-file');
+  assert.equal(kc.has(service), false);
+});
+
+test('deleting a profile evicts its run dir Keychain item', onDarwin, (t) => {
+  const { home } = sandbox(t);
+  const kc = fakeSecurity(t, home);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: null }, cfg);
+  const dir = materializeRunDir('work', cfg);
+  kc.put(keychainServiceFor(dir, cfg), usageCreds());
+  deleteProfileFile('work', cfg);
+  assert.equal(kc.has(keychainServiceFor(dir, cfg)), false);
+  assert.equal(fs.existsSync(dir), false);
 });
 
 test('encryptText/decryptText round-trip; wrong passphrase and tampering fail', () => {

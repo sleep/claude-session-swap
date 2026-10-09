@@ -139,6 +139,21 @@ export function evictKeychainEntry(cfg = config()) {
   throw new Error(`security delete-generic-password failed: ${r.stderr.trim()}`);
 }
 
+// Claude keys its Keychain item by config dir: the default ~/.claude uses the
+// bare service name, any other CLAUDE_CONFIG_DIR gets "-" plus the first 8 hex
+// chars of sha256 over the path exactly as claude received it. So a session in
+// a run dir refreshes into an item the base service name never sees.
+export function keychainServiceFor(configDir, cfg = config()) {
+  if (!cfg.keychainService) return null;
+  if (path.resolve(configDir) === path.join(os.homedir(), '.claude')) return cfg.keychainService;
+  return `${cfg.keychainService}-${crypto.createHash('sha256').update(configDir).digest('hex').slice(0, 8)}`;
+}
+
+// A cfg whose Keychain accessors address one run dir's item.
+function runDirCfg(dir, cfg) {
+  return { ...cfg, keychainService: keychainServiceFor(dir, cfg) };
+}
+
 // --- File credential store (all platforms) --------------------------------------
 // Claude Code keeps the same payload as a 0600 file at ~/.claude/.credentials.json.
 
@@ -459,7 +474,9 @@ export function deleteProfileFile(name, cfg = config()) {
   validateName(name);
   if (!profileExists(name, cfg)) throw new UsageError(`no profile named "${name}"`);
   fs.rmSync(profilePath(name, cfg));
-  fs.rmSync(path.join(cfg.home, 'dirs', name), { recursive: true, force: true });
+  const dir = runDirPath(name, cfg);
+  fs.rmSync(dir, { recursive: true, force: true });
+  evictKeychainEntry(runDirCfg(dir, cfg)); // claude's per-dir item would otherwise outlive the dir
   fs.rmSync(path.join(cfg.usageCacheDir, `${name}.json`), { force: true });
 }
 
@@ -617,6 +634,23 @@ export function tokenExpiry(credentials) {
   } catch {
     return '-';
   }
+}
+
+function credentialsExpiryMs(credentials) {
+  try {
+    return expiryMs(JSON.parse(credentials)) ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Of two copies of one account's chain, the later-expiring one is the copy
+// whose refresh token is still alive: every refresh pushes expiry forward and
+// kills the token it replaced. Ties (or no expiry at all) keep the first.
+function newerCredentials(a, b) {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return credentialsExpiryMs(b) > credentialsExpiryMs(a) ? b : a;
 }
 
 export function formatList(cfg = config()) {
@@ -1024,10 +1058,63 @@ export function importAll(src, { force = false, dryRun = false } = {}, cfg = con
 
 // --- Isolated run (no global mutation) -----------------------------------------
 
+function runDirPath(name, cfg) {
+  return path.join(cfg.home, 'dirs', name);
+}
+
+function runDirCredentialsFile(dir, cfg) {
+  return cfg.target === 'kimi' ? path.join(dir, 'credentials', 'kimi-code.json') : path.join(dir, '.credentials.json');
+}
+
+// What a run dir currently holds. On macOS claude prefers the Keychain, so a
+// mid-session refresh lands in the dir's own item rather than the file; that
+// copy is folded into the file and evicted here, leaving the file the single
+// copy claude reads next time and nothing stale behind to replay.
+function readRunDir(dir, cfg) {
+  const none = { credentials: null, oauthAccount: null };
+  if (!fs.existsSync(dir)) return none;
+  const credFile = runDirCredentialsFile(dir, cfg);
+  let credentials = null;
+  try {
+    credentials = fs.readFileSync(credFile, 'utf8') || null;
+  } catch {}
+  const kcCfg = runDirCfg(dir, cfg);
+  const fromKeychain = readKeychainEntry(kcCfg);
+  if (fromKeychain) {
+    if (newerCredentials(credentials, fromKeychain) === fromKeychain) {
+      credentials = fromKeychain;
+      fs.mkdirSync(path.dirname(credFile), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(credFile, credentials, { mode: 0o600 });
+    }
+    evictKeychainEntry(kcCfg);
+  }
+  if (!credentials) return none;
+  let oauthAccount = null;
+  if (cfg.target === 'kimi') {
+    oauthAccount = kimiIdentityFromCredentials(credentials);
+  } else {
+    try {
+      oauthAccount = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')).oauthAccount ?? null;
+    } catch {}
+  }
+  return { credentials, oauthAccount };
+}
+
 export function materializeRunDir(name, cfg = config()) {
   const profile = loadProfile(name, cfg);
   assertNotMoved(name, profile, cfg);
-  const dir = path.join(cfg.home, 'dirs', name);
+  const dir = runDirPath(name, cfg);
+  // A session that ended without its save-back (crash, kill -9) leaves the
+  // only live copy of the chain in the run dir; writing the profile snapshot
+  // over it would hand the next session a token that is already dead.
+  const left = readRunDir(dir, cfg);
+  if (left.credentials && sameAccount(left.oauthAccount, profile.oauthAccount)) {
+    const fresh = newerCredentials(profile.credentials, left.credentials);
+    if (fresh !== profile.credentials) {
+      profile.credentials = fresh;
+      saveProfile(name, { credentials: fresh, oauthAccount: profile.oauthAccount }, cfg);
+    }
+  }
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (cfg.target === 'kimi') {
     // The run dir is a whole KIMI_CODE_HOME: credentials plus a minimal
@@ -1070,31 +1157,17 @@ export function materializeRunDir(name, cfg = config()) {
 // profile's snapshot is dead. Persist whatever the session left in the run
 // dir back into the profile, or the next run starts from a revoked token.
 export function saveBackRunDir(name, dir, cfg = config()) {
-  const credFile =
-    cfg.target === 'kimi' ? path.join(dir, 'credentials', 'kimi-code.json') : path.join(dir, '.credentials.json');
-  let credentials;
-  try {
-    credentials = fs.readFileSync(credFile, 'utf8');
-  } catch {
-    return;
-  }
-  if (!credentials) return;
-  let oauthAccount = null;
-  if (cfg.target === 'kimi') {
-    oauthAccount = kimiIdentityFromCredentials(credentials);
-  } else {
-    try {
-      oauthAccount = JSON.parse(fs.readFileSync(path.join(dir, '.claude.json'), 'utf8')).oauthAccount ?? null;
-    } catch {}
-  }
+  const { credentials, oauthAccount } = readRunDir(dir, cfg);
+  if (!credentials) return false;
   const profile = loadProfile(name, cfg);
   if (!sameAccount(oauthAccount, profile.oauthAccount)) {
     console.error(
       `warning: the run session's login doesn't match profile "${name}"; its saved credentials were left untouched`,
     );
-    return;
+    return false;
   }
   saveProfile(name, { credentials, oauthAccount: oauthAccount ?? profile.oauthAccount }, cfg);
+  return true;
 }
 
 export function runProfile(name, toolArgs, cfg = config()) {

@@ -703,6 +703,29 @@ test('kimiUsageCmd uses live credentials for the active profile without refreshi
   assert.deepEqual(urls, ['https://api.kimi.com/coding/v1/usages', 'https://api.kimi.com/coding/v1/me']);
 });
 
+test('kimiUsageCmd refreshes from the run dir chain when it is newer than the snapshot', async (t) => {
+  sandbox(t);
+  const cfg = config('kimi');
+  saveProfile('work', { credentials: kimiCreds({ sub: 'u-1', expiresIn: -7200, refreshToken: 'rt-old' }), oauthAccount: { userId: 'u-1' } }, cfg);
+  const dir = materializeRunDir('work', cfg);
+  const credFile = path.join(dir, 'credentials', 'kimi-code.json');
+  fs.writeFileSync(credFile, kimiCreds({ sub: 'u-1', expiresIn: -60, refreshToken: 'rt-run' }));
+  const refreshedFrom = [];
+  const fetchImpl = async (url, init) => {
+    if (url.includes('/api/oauth/token')) {
+      refreshedFrom.push(new URLSearchParams(init.body).get('refresh_token'));
+      return { ok: true, status: 200, json: async () => ({ access_token: fakeJwt({ sub: 'u-1' }), refresh_token: 'rt-new', expires_in: 900 }) };
+    }
+    if (url.endsWith('/usages')) return { ok: true, status: 200, json: async () => ({}) };
+    return { ok: false, status: 404 };
+  };
+  captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.deepEqual(refreshedFrom, ['rt-run']);
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).refresh_token, 'rt-new');
+  assert.equal(JSON.parse(fs.readFileSync(credFile, 'utf8')).refresh_token, 'rt-new');
+});
+
 test('kimiUsageCmd fails soft per profile and only exits 1 when all fail', async (t) => {
   sandbox(t);
   const cfg = config('kimi');

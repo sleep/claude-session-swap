@@ -1215,6 +1215,63 @@ test('usageCmd uses live credentials for the active profile without refreshing',
   assert.equal(urls.length, 1); // usage only, no token refresh
 });
 
+test('usageCmd refreshes from the run dir chain when it is newer than the snapshot', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  const snapshot = JSON.stringify({ claudeAiOauth: { accessToken: 'at-old', refreshToken: 'rt-old', expiresAt: 1000 } });
+  saveProfile('work', { credentials: snapshot, oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  // A run session rotated the chain and saved the pair into its dir, so the
+  // snapshot's refresh token is already dead; both copies are expired now.
+  const dir = materializeRunDir('work', cfg);
+  const rotated = JSON.stringify({ claudeAiOauth: { accessToken: 'at-run', refreshToken: 'rt-run', expiresAt: 2000 } });
+  fs.writeFileSync(path.join(dir, '.credentials.json'), rotated);
+  const refreshedFrom = [];
+  const fetchImpl = async (url, init) => {
+    if (url.includes('/oauth/token')) {
+      refreshedFrom.push(JSON.parse(init.body).refresh_token);
+      return { ok: true, status: 200, json: async () => ({ access_token: 'at-new', refresh_token: 'rt-new', expires_in: 28800 }) };
+    }
+    assert.equal(init.headers.Authorization, 'Bearer at-new');
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  captureLog(t);
+  assert.equal(await usageCmd({}, cfg, fetchImpl), 0);
+  assert.deepEqual(refreshedFrom, ['rt-run']);
+  // The new pair reached both the profile and the run dir, so a session
+  // still open there re-reads it instead of replaying rt-run.
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.refreshToken, 'rt-new');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.credentials.json'), 'utf8')).claudeAiOauth.refreshToken, 'rt-new');
+
+  // A still-valid run dir chain is used as is, without any refresh.
+  fs.writeFileSync(path.join(dir, '.credentials.json'), usageCreds({ accessToken: 'at-fresh', expiresAt: Date.now() + 36e6 }));
+  refreshedFrom.length = 0;
+  const seen = [];
+  assert.equal(
+    await usageCmd({}, cfg, async (url, init) => {
+      seen.push(init.headers?.Authorization);
+      return { ok: true, status: 200, json: async () => ({}) };
+    }),
+    0,
+  );
+  assert.deepEqual(seen, ['Bearer at-fresh']);
+});
+
+test('usageCmd ignores a run dir that holds another account', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds({ accessToken: 'at-mine' }), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const dir = materializeRunDir('work', cfg);
+  fs.writeFileSync(path.join(dir, '.claude.json'), JSON.stringify({ oauthAccount: { emailAddress: 'other@x.com' } }));
+  fs.writeFileSync(path.join(dir, '.credentials.json'), usageCreds({ accessToken: 'at-other', expiresAt: Date.now() + 9e6 }));
+  const seen = [];
+  captureLog(t);
+  await usageCmd({}, cfg, async (url, init) => {
+    seen.push(init.headers.Authorization);
+    return { ok: true, status: 200, json: async () => ({}) };
+  });
+  assert.deepEqual(seen, ['Bearer at-mine']);
+});
+
 test('fetchUsage maps 429 to RateLimitedError', async () => {
   await assert.rejects(fetchUsage(usageCreds(), async () => ({ ok: false, status: 429 })), RateLimitedError);
 });

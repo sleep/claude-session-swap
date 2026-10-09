@@ -1246,6 +1246,38 @@ async function usageWithCache(name, cfg, fetchFn) {
   }
 }
 
+// The copy of a profile's chain to query with: the live login when the
+// profile is active, else the later-expiring of the snapshot and whatever its
+// run dir holds (a session there may have rotated the chain hours ago).
+// Refreshing from the older copy would replay a refresh token already dead.
+function freshestCredentials(p, isActive, cfg) {
+  if (isActive) return readCredentials(cfg) ?? p.credentials;
+  const left = readRunDir(runDirPath(p.name, cfg), cfg);
+  if (left.credentials && sameAccount(left.oauthAccount, p.oauthAccount)) {
+    return newerCredentials(p.credentials, left.credentials);
+  }
+  return p.credentials;
+}
+
+// Persist-before-use for a rotated chain: the profile always, plus the live
+// copy it was read from, so an open session picks the new pair up (claude
+// re-reads its credentials file when the mtime changes) instead of replaying
+// the pair that just died.
+function persistRefreshed(name, credentials, oauthAccount, isActive, cfg) {
+  saveProfile(name, { credentials, oauthAccount }, cfg);
+  if (isActive) {
+    writeCredentials(credentials, cfg);
+    return;
+  }
+  const dir = runDirPath(name, cfg);
+  const credFile = runDirCredentialsFile(dir, cfg);
+  if (!fs.existsSync(credFile)) return;
+  const tmp = `${credFile}.ccswitch-${process.pid}.tmp`;
+  fs.writeFileSync(tmp, credentials, { mode: 0o600 });
+  fs.renameSync(tmp, credFile);
+  evictKeychainEntry(runDirCfg(dir, cfg));
+}
+
 export function tokenExpired(credentials, now = Date.now()) {
   try {
     const ms = expiryMs(JSON.parse(credentials));
@@ -1610,7 +1642,7 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
       ]);
       continue;
     }
-    let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+    let credentials = freshestCredentials(p, isActive, cfg);
     let status = { kind: 'ok' };
     let usage = null;
     try {
@@ -1619,8 +1651,7 @@ async function claudeUsageRows(profiles, active, cfg, fetchImpl, color) {
         credentials = await refreshCredentials(credentials, fetchImpl);
         // Persist-before-use: the rotated chain reaches disk before anything
         // can go wrong with the usage call (or the process).
-        saveProfile(p.name, { credentials, oauthAccount: p.oauthAccount }, cfg);
-        if (isActive) writeCredentials(credentials, cfg);
+        persistRefreshed(p.name, credentials, p.oauthAccount, isActive, cfg);
       }
       const got = await usageWithCache(p.name, cfg, () => fetchUsage(credentials, fetchImpl));
       usage = got.usage;
@@ -1687,7 +1718,7 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
       ]);
       continue;
     }
-    let credentials = isActive ? (readCredentials(cfg) ?? p.credentials) : p.credentials;
+    let credentials = freshestCredentials(p, isActive, cfg);
     let oauthAccount = p.oauthAccount;
     let status = { kind: 'ok' };
     let usage = null;
@@ -1697,8 +1728,7 @@ async function kimiUsageRows(profiles, active, cfg, fetchImpl, color) {
         credentials = await refreshKimiCredentials(credentials, fetchImpl, { oauthHost: oauthAccount?.oauthHost });
         // Persist-before-use: the rotated chain reaches disk before anything
         // can go wrong with the usage call (or the process).
-        saveProfile(p.name, { credentials, oauthAccount }, cfg);
-        if (isActive) writeCredentials(credentials, cfg);
+        persistRefreshed(p.name, credentials, oauthAccount, isActive, cfg);
       }
       const baseUrl = oauthAccount?.baseUrl ?? readKimiConnection(cfg).baseUrl;
       const got = await usageWithCache(p.name, cfg, () => fetchKimiUsage(credentials, fetchImpl, { baseUrl }));

@@ -2057,8 +2057,10 @@ const COMMANDS = [
   ['login <name>', 'log a new account in and save it as <name> (--force re-logs into an existing profile)'],
   ['save <name>', 'save the current login as <name> (--force overwrites)'],
   ['run <name> -- [...]', 'one-off BIN session as <name> (no global switch)'],
-  ['list', 'show saved profiles'],
-  ['usage', 'show QUOTA for every profile (refreshes expired tokens)'],
+  ['list', 'show saved profiles (--json)'],
+  ['usage', 'show QUOTA for every profile (refreshes expired tokens; --json, --cached skips the network)'],
+  ['whoami', 'show the live login and its QUOTA, saved as a profile or not (--json, --cached)'],
+  ['doctor', 'report the tool, store, live login and Keychain state (--json)'],
   ['delete <name>', 'delete a profile (--force skips confirmation)'],
   ['export <name> [file]', 'write a profile to a plaintext file (--move retires it here)'],
   ['import <name> [file]', 'load a profile from such a file (--force overwrites)'],
@@ -2098,7 +2100,7 @@ prefix. (A claude profile literally named "kimi" stays reachable via
 CCSWITCH_PASSPHRASE and KCSWITCH_PASSPHRASE both work for either store.`;
 
   const store = cfg.target === 'kimi' ? '~/.kimi-profiles' : '~/.claude-profiles';
-  return `usage: ${cfg.prog} [--dry-run] <command>
+  return `usage: ${cfg.prog} [--dry-run] [--json] <command>
 
 ${table}
 
@@ -2114,6 +2116,76 @@ copies so this machine cannot revoke the moved chains later.
 State lives in ${store}. Every mutation writes a backup there first.
 Unencrypted stores keep tokens in plaintext; run "${cfg.prog} encrypt" to protect
 them at rest. CCSWITCH_PASSPHRASE skips the interactive passphrase prompt.`;
+}
+
+// --- whoami / doctor (human output) ----------------------------------------------
+// JSON goes to stdout only and carries the exact library shapes; these two
+// render the same records the way the tables do.
+
+function kv(pairs) {
+  const width = Math.max(...pairs.map(([k]) => k.length));
+  return pairs.map(([k, v]) => `${k.padEnd(width)}  ${v}`).join('\n');
+}
+
+function usageLines(usage, target, color) {
+  if (!usage) return [];
+  if (target === 'kimi') {
+    return [
+      ['week', usage.summary ? `${formatBar(usage.summary.utilization, { color })}  ${formatResetIn(usage.summary.resetsAt)}` : '-'],
+      ['limits', usage.limits.length
+        ? usage.limits.map((l) => `${l.label ?? l.name} ${formatBar(l.utilization, { color })} ${formatResetIn(l.resetsAt)}`).join('  ')
+        : '-'],
+      ['booster', usage.booster ? formatCents(usage.booster.balanceCents, usage.booster.currency) : '-'],
+    ];
+  }
+  const win = (w) => (w ? `${formatBar(w.utilization, { color })}  ${formatResetIn(w.resetsAt)}` : '-');
+  return [['5h', win(usage.fiveHour)], ['7d', win(usage.sevenDay)], ['fable', win(usage.fable)]];
+}
+
+export function formatWhoami(identity, usage, cfg = config(), { color = false } = {}) {
+  if (!identity.loggedIn) return `not logged in to ${cfg.toolName}`;
+  const pairs = [
+    ['account', identity.account ?? '-'],
+    [cfg.target === 'kimi' ? 'level' : 'tier', identity.tier ?? '-'],
+  ];
+  if (cfg.target !== 'kimi') pairs.push(['plan', identity.subscriptionType ?? '-']);
+  pairs.push(
+    ['profile', identity.profile ? `${identity.profile}${identity.profile === getActive(cfg) ? ' (active)' : ''}` : '(not saved)'],
+    ['token', identity.tokenExpiresAt ? `expires ${identity.tokenExpiresAt}` : '-'],
+  );
+  if (usage) pairs.push(...usageLines(usage.usage, cfg.target, color), ['state', formatStatus(usage.state, { color }).trim()]);
+  return kv(pairs);
+}
+
+export function formatDoctor(d, cfg = config()) {
+  const store = d.store.readable
+    ? `${d.store.profiles.length} profile(s), active: ${d.store.active ?? 'none'}, ${d.store.encrypted ? 'encrypted' : 'plaintext'}`
+    : 'encrypted and locked (set CCSWITCH_PASSPHRASE)';
+  const live = d.live.loggedIn
+    ? `${d.live.account ?? 'unknown account'}${d.live.tier ? ` (${d.live.tier})` : ''}, ` +
+      `${d.live.profile ? `profile "${d.live.profile}"` : 'not saved as a profile'}, ` +
+      `token ${d.live.tokenExpiresAt ? `expires ${d.live.tokenExpiresAt}` : 'expiry unknown'}`
+    : 'none';
+  const pairs = [
+    [cfg.procName, d.bin.found ?? `${d.bin.name} NOT FOUND on PATH`],
+    ['store', `${d.store.home} (${d.store.exists ? store : 'not created yet'})`],
+    ['live login', live],
+    ['credentials', `${d.credentialsFile.path} ${d.credentialsFile.present ? 'present' : 'absent'}`],
+  ];
+  if (d.keychain) {
+    const k = d.keychain;
+    const presence = (p) => (p === null ? 'unknown' : p ? 'PRESENT' : 'absent');
+    pairs.push([
+      'keychain',
+      !k.available
+        ? 'security tool not available'
+        : `${k.locked === null ? 'lock state unknown' : k.locked ? 'LOCKED' : 'unlocked'}; ` +
+          `default item ${presence(k.defaultEntry.present)}` +
+          (k.runDirEntries.length ? `; run dirs: ${k.runDirEntries.map((e) => `${e.name} ${presence(e.present)}`).join(', ')}` : ''),
+    ]);
+  }
+  pairs.push(['node', `${d.node} on ${d.platform}`]);
+  return kv(pairs);
 }
 
 function requireName(name, cfg) {
@@ -2213,7 +2285,9 @@ export async function main(argv = process.argv.slice(2)) {
   const head = sep === -1 ? argv : argv.slice(0, sep);
   const tail = sep === -1 ? [] : argv.slice(sep + 1);
   const dryRun = head.includes('--dry-run');
-  const args = head.filter((a) => a !== '--dry-run');
+  const json = head.includes('--json');
+  const cached = head.includes('--cached');
+  const args = head.filter((a) => a !== '--dry-run' && a !== '--json' && a !== '--cached');
   // A leading "kimi" selects the Kimi Code backend; without it the target is
   // claude, unless the tool is running under its "kcswitch" bin name.
   const target = args[0] === 'kimi' ? 'kimi' : defaultTarget();
@@ -2264,10 +2338,22 @@ export async function main(argv = process.argv.slice(2)) {
       switchTo(requireName(rest[0], cfg), { dryRun }, cfg);
       return 0;
     case 'list':
-      console.log(formatList(cfg));
+      console.log(json ? JSON.stringify(listProfileRecords(cfg), null, 2) : formatList(cfg));
       return 0;
     case 'usage':
-      return usageCmd({ dryRun }, cfg);
+      return usageCmd({ dryRun, json, cached }, cfg);
+    case 'whoami': {
+      const identity = liveIdentity(cfg);
+      const usage = identity.loggedIn && !dryRun ? await liveUsage({ refresh: !cached }, cfg) : null;
+      if (json) console.log(JSON.stringify({ ...identity, usage: usage?.usage ?? null, cachedAt: usage?.cachedAt ?? null, state: usage?.state ?? null }, null, 2));
+      else console.log(formatWhoami(identity, usage, cfg, { color: shouldUseColor() }));
+      return identity.loggedIn ? 0 : 1;
+    }
+    case 'doctor': {
+      const d = doctor(cfg);
+      console.log(json ? JSON.stringify(d, null, 2) : formatDoctor(d, cfg));
+      return d.bin.found && d.store.readable ? 0 : 1;
+    }
     case 'delete':
       await deleteProfileCmd(requireName(rest[0], cfg), { force: rest.includes('--force'), dryRun }, cfg);
       return 0;

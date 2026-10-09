@@ -832,6 +832,33 @@ test('cli: kimi prefix routes list, switch and usage dry-run to the kimi store',
   assert.equal(profileExists('work', cfg), true);
 });
 
+test('cli: the kimi prefix routes list --json, whoami and doctor to the kimi store', (t) => {
+  sandbox(t);
+  const cfg = config('kimi');
+  saveProfile('work', { credentials: kimiCreds({ sub: 'u-1' }), oauthAccount: { userId: 'u-1', nickname: 'Shy', userLevelName: 'Pro' } }, cfg);
+  writeCredentials(kimiCreds({ sub: 'u-1' }), cfg);
+  const env = { ...kimiEnv(), CCSWITCH_CACHE_DIR: process.env.CCSWITCH_CACHE_DIR, NO_COLOR: '1' };
+
+  const list = JSON.parse(runCli(['kimi', 'list', '--json'], env).stdout);
+  assert.equal(list.target, 'kimi');
+  assert.equal(list.profiles[0].account, 'Shy');
+  assert.equal(list.profiles[0].tier, 'Pro');
+
+  const who = runCli(['kimi', 'whoami', '--cached'], env);
+  assert.equal(who.status, 0, who.stderr);
+  assert.match(who.stdout, /account +Shy/);
+  assert.match(who.stdout, /level +Pro/);
+  assert.match(who.stdout, /profile +work/);
+  assert.doesNotMatch(who.stdout, /plan/); // kimi has no subscription type
+  assert.match(who.stdout, /state +! no cached usage/);
+
+  const d = JSON.parse(runCli(['kimi', 'doctor', '--json'], env).stdout);
+  assert.equal(d.target, 'kimi');
+  assert.equal(d.keychain, null);
+  assert.equal(d.live.account, 'Shy');
+  assert.equal(d.credentialsFile.path, cfg.credentialsFile);
+});
+
 test('cli: kimi --help documents the kimi command set', (t) => {
   sandbox(t);
   const r = runCli(['kimi', '--help'], kimiEnv());

@@ -8,7 +8,7 @@ import crypto from 'node:crypto';
 
 import { sandbox, fakeClaudeBin, fakeSecurity, onDarwin, usageCreds, captureLog, captureErr, runCli } from './helpers.mjs';
 
-import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, formatAgo, formatStatus, keychainServiceFor } from '../ccswitch.mjs';
+import { config, validateName, ensureHome, UsageError, readCredentials, writeCredentials, deleteCredentials, readClaudeJson, updateOauthAccount, saveProfile, loadProfile, profileExists, listProfiles, deleteProfileFile, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, exportAll, importAll, materializeRunDir, runProfile, saveBackRunDir, encryptText, decryptText, isEncrypted, setPassphrase, storeEncrypted, setStoreEncryption, main, tokenExpired, refreshCredentials, AuthDeadError, fetchUsage, parseUsage, formatBar, formatResetIn, renderTable, usageCmd, shouldUseColor, parseFableLimit, CancelledError, asCancel, reportFatal, progName, defaultTarget, RateLimitedError, readUsageCache, writeUsageCache, formatAgo, formatStatus, keychainServiceFor } from '../ccswitch.mjs';
 
 test('config picks up env overrides', (t) => {
   const { home } = sandbox(t);
@@ -928,6 +928,131 @@ test('cli: --dry-run after -- passes through to claude untouched', (t) => {
   });
   assert.equal(r.status, 0);
   assert.equal(fs.readFileSync(process.env.CCSWITCH_TEST_OUT, 'utf8'), '--dry-run --model opus');
+});
+
+function cliEnv() {
+  return {
+    CCSWITCH_HOME: process.env.CCSWITCH_HOME,
+    CCSWITCH_CLAUDE_JSON: process.env.CCSWITCH_CLAUDE_JSON,
+    CCSWITCH_KEYCHAIN_SERVICE: process.env.CCSWITCH_KEYCHAIN_SERVICE,
+    CCSWITCH_CREDENTIALS_FILE: process.env.CCSWITCH_CREDENTIALS_FILE,
+    CCSWITCH_CACHE_DIR: process.env.CCSWITCH_CACHE_DIR,
+  };
+}
+
+test('cli: list --json prints profile records to stdout and nothing else', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds({ subscriptionType: 'max' }), oauthAccount: { accountUuid: 'u-1', emailAddress: 'w@x.com' } }, cfg);
+  setActive('work', cfg);
+  const r = runCli(['list', '--json'], cliEnv());
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stderr, '');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.active, 'work');
+  assert.equal(out.profiles[0].name, 'work');
+  assert.equal(out.profiles[0].subscriptionType, 'max');
+  assert.doesNotMatch(r.stdout, /at-1|rt-1/); // never the credentials
+  // The flag is position-independent, like --dry-run.
+  assert.deepEqual(JSON.parse(runCli(['--json', 'list'], cliEnv()).stdout), out);
+});
+
+test('cli: usage --json --cached answers from the cache without any network', (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  writeUsageCache('work', { fiveHour: { utilization: 33, resetsAt: null }, sevenDay: null, fable: null }, cfg, 1234);
+  const r = runCli(['usage', '--json', '--cached'], cliEnv());
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stderr, '');
+  const out = JSON.parse(r.stdout);
+  assert.equal(out.target, 'claude');
+  assert.equal(out.profiles[0].usage.fiveHour.utilization, 33);
+  assert.deepEqual(out.profiles[0].state, { kind: 'cached', at: 1234 });
+
+  // An empty store is an empty list, not the "no profiles yet" prose.
+  fs.rmSync(path.join(cfg.home, 'profiles'), { recursive: true });
+  const empty = runCli(['usage', '--json', '--cached'], cliEnv());
+  assert.equal(empty.status, 0, empty.stderr);
+  assert.deepEqual(JSON.parse(empty.stdout).profiles, []);
+});
+
+test('usageCmd --json exits 1 only when every profile failed', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const lines = captureLog(t);
+  assert.equal(await usageCmd({ json: true }, cfg, async () => ({ ok: false, status: 500, json: async () => ({}) })), 1);
+  assert.deepEqual(JSON.parse(lines.join('\n')).profiles[0].state, { kind: 'error', message: 'usage request failed (HTTP 500)' });
+  lines.length = 0;
+  assert.equal(await usageCmd({ json: true }, cfg, async () => ({ ok: true, status: 200, json: async () => ({ five_hour: { utilization: 1 } }) })), 0);
+  assert.equal(JSON.parse(lines.join('\n')).profiles[0].usage.fiveHour.utilization, 1);
+});
+
+test('cli: whoami describes the live login, with and without --json', (t) => {
+  sandbox(t);
+  const cfg = config();
+  const none = runCli(['whoami'], cliEnv());
+  assert.equal(none.status, 1);
+  assert.match(none.stdout, /not logged in to Claude Code/);
+  assert.equal(JSON.parse(runCli(['whoami', '--json'], cliEnv()).stdout).loggedIn, false);
+
+  writeCredentials(usageCreds({ subscriptionType: 'max' }), cfg);
+  fs.writeFileSync(cfg.claudeJson, JSON.stringify({ oauthAccount: { accountUuid: 'u-1', emailAddress: 'me@x.com', organizationRateLimitTier: 'default_claude_max_5x' } }));
+  saveProfile('work', { credentials: null, oauthAccount: { accountUuid: 'u-1', emailAddress: 'me@x.com' } }, cfg);
+  setActive('work', cfg);
+  writeUsageCache('.live', { fiveHour: { utilization: 63, resetsAt: null }, sevenDay: { utilization: 19, resetsAt: null }, fable: null }, cfg, Date.now());
+  // --cached keeps the test off the network; the live cache answers instead.
+  const r = runCli(['whoami', '--cached'], { ...cliEnv(), NO_COLOR: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /account +me@x\.com/);
+  assert.match(r.stdout, /tier +default_claude_max_5x/);
+  assert.match(r.stdout, /plan +max/);
+  assert.match(r.stdout, /profile +work \(active\)/);
+  assert.match(r.stdout, /5h +.*63%/);
+  assert.match(r.stdout, /fable +-/);
+  assert.match(r.stdout, /state +◷/);
+  assert.doesNotMatch(r.stdout, /at-1|rt-1/);
+
+  const j = JSON.parse(runCli(['whoami', '--json', '--cached'], cliEnv()).stdout);
+  assert.equal(j.loggedIn, true);
+  assert.equal(j.account, 'me@x.com');
+  assert.equal(j.profile, 'work');
+  assert.equal(j.usage.fiveHour.utilization, 63);
+  assert.equal(j.state.kind, 'cached');
+});
+
+test('cli: doctor reports the setup and exits 1 when the tool binary is missing', (t) => {
+  const { home } = sandbox(t);
+  t.after(() => { delete process.env.CCSWITCH_CLAUDE_BIN; });
+  const bin = fakeClaudeBin(home, 'true\n');
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds(), oauthAccount: { accountUuid: 'u-1', emailAddress: 'w@x.com' } }, cfg);
+  const env = { ...cliEnv(), CCSWITCH_CLAUDE_BIN: bin };
+  const r = runCli(['doctor'], env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, new RegExp(`claude +${bin}`));
+  assert.match(r.stdout, /store +.*1 profile\(s\), active: none, plaintext/);
+  assert.match(r.stdout, /live login +none/);
+  assert.match(r.stdout, /credentials +.* absent/);
+  assert.doesNotMatch(r.stdout, /at-1|rt-1/);
+
+  const j = JSON.parse(runCli(['doctor', '--json'], env).stdout);
+  assert.deepEqual(j.store.profiles, ['work']);
+  assert.equal(j.bin.found, bin);
+  assert.equal(j.live.loggedIn, false);
+
+  const missing = runCli(['doctor'], { ...cliEnv(), CCSWITCH_CLAUDE_BIN: 'no-such-tool-anywhere' });
+  assert.equal(missing.status, 1);
+  assert.match(missing.stdout, /NOT FOUND on PATH/);
+});
+
+test('cli: --help lists whoami and doctor', (t) => {
+  sandbox(t);
+  const r = runCli(['--help']);
+  assert.match(r.stdout, /\n  ccswitch whoami /);
+  assert.match(r.stdout, /\n  ccswitch doctor /);
+  assert.match(r.stdout, /usage: ccswitch \[--dry-run\] \[--json\]/);
 });
 
 test('cli: delete --dry-run deletes nothing', (t) => {

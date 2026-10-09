@@ -361,6 +361,8 @@ export function liveUsage(opts?: { refresh?: boolean }, cfg?: Config, fetchImpl?
 export function usageCmd(opts?: { dryRun?: boolean; json?: boolean; cached?: boolean }, cfg?: Config, fetchImpl?: FetchImpl): Promise<number>;
 export function kimiUsageCmd(opts?: { dryRun?: boolean; json?: boolean; cached?: boolean }, cfg?: KimiConfig, fetchImpl?: FetchImpl): Promise<number>;
 export function doctor(cfg?: Config): DoctorReport;
+export function formatWhoami(identity: LiveIdentity, usage: LiveUsage | null, cfg?: Config, opts?: { color?: boolean }): string;
+export function formatDoctor(report: DoctorReport, cfg?: Config): string;
 
 export function main(argv?: string[]): Promise<number>;
 export function reportFatal(err: unknown): number;

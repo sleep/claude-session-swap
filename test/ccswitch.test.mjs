@@ -977,6 +977,18 @@ test('cli: usage --json --cached answers from the cache without any network', (t
   assert.deepEqual(JSON.parse(empty.stdout).profiles, []);
 });
 
+test('usageCmd --json under --dry-run touches neither the network nor the tokens', async (t) => {
+  sandbox(t);
+  const cfg = config();
+  saveProfile('work', { credentials: usageCreds({ expiresAt: 1 }), oauthAccount: { emailAddress: 'w@x.com' } }, cfg);
+  const lines = captureLog(t);
+  await usageCmd({ json: true, dryRun: true }, cfg, async () => {
+    throw new Error('network hit');
+  });
+  assert.deepEqual(JSON.parse(lines.join('\n')).profiles[0].state, { kind: 'error', message: 'no cached usage' });
+  assert.equal(JSON.parse(loadProfile('work', cfg).credentials).claudeAiOauth.expiresAt, 1);
+});
+
 test('usageCmd --json exits 1 only when every profile failed', async (t) => {
   sandbox(t);
   const cfg = config();

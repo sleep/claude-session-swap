@@ -1921,7 +1921,8 @@ async function usageRows(profiles, active, cfg, fetchImpl, color) {
 
 export async function usageCmd({ dryRun = false, json = false, cached = false } = {}, cfg = config(), fetchImpl = fetch) {
   if (json) {
-    const report = await listProfilesWithUsage({ refresh: !cached }, cfg, fetchImpl);
+    // --dry-run must stay a no-op, so it reads like --cached here.
+    const report = await listProfilesWithUsage({ refresh: !cached && !dryRun }, cfg, fetchImpl);
     console.log(JSON.stringify(report, null, 2));
     return report.profiles.length === 0 || report.profiles.some((r) => SUCCEEDED.has(r.state.kind)) ? 0 : 1;
   }

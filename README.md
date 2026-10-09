@@ -6,7 +6,7 @@ Claude Code stores its login credentials in `~/.claude/.credentials.json` plus a
 
 Kimi Code gets the same treatment: prefix any command with `kimi` (or use the `kcswitch` bin alias) and every command below works against Kimi Code logins — see [Kimi Code accounts](#kimi-code-accounts).
 
-On macOS, Claude Code itself prefers the Keychain. `ccswitch` never writes to it: a lingering Keychain entry is read once as the freshest copy of your tokens, then evicted on the next switch so Claude Code falls back to the credentials file and the file stays the single source of truth. Kimi Code is file-only on every platform, so none of that applies to `kimi` commands.
+On macOS, Claude Code itself prefers the Keychain. `ccswitch` never writes to it: a lingering Keychain entry is read once as the freshest copy of your tokens, then evicted on the next switch so Claude Code falls back to the credentials file and the file stays the single source of truth. Claude Code keys its Keychain item by config dir (the default `~/.claude` uses the plain `Claude Code-credentials` name; any other `CLAUDE_CONFIG_DIR` gets a hash suffix), and `ccswitch` tracks the item for each per-profile run dir the same way. Kimi Code is file-only on every platform, so none of that applies to `kimi` commands.
 
 ## Install
 
@@ -29,8 +29,10 @@ ccswitch switch <name>        same as above
 ccswitch login <name>         log a new account in and save it as <name> (--force re-logs into an existing profile)
 ccswitch save <name>          save the current login as <name> (--force overwrites)
 ccswitch run <name> -- [...]  one-off claude session as <name> (no global switch)
-ccswitch list                 show saved profiles
-ccswitch usage                show 5h/7d/fable quota for every profile (refreshes expired tokens)
+ccswitch list                 show saved profiles (--json)
+ccswitch usage                show 5h/7d/fable quota for every profile (refreshes expired tokens; --json, --cached skips the network)
+ccswitch whoami               show the live login and its quota, saved as a profile or not (--json, --cached)
+ccswitch doctor               report the tool, store, live login and Keychain state (--json)
 ccswitch delete <name>        delete a profile (--force skips confirmation)
 ccswitch export <name> [file] write a profile to a plaintext file (--move retires it here)
 ccswitch import <name> [file] load a profile from such a file (--force overwrites)
@@ -41,6 +43,8 @@ ccswitch decrypt              turn passphrase encryption back off (rewrites the 
 ```
 
 Every command accepts `--dry-run` to print what it would do without touching anything. Every command also works for Kimi Code by prefixing with `kimi` — `ccswitch kimi save work`, `ccswitch kimi usage`, etc.
+
+`list`, `usage`, `whoami` and `doctor` take `--json` for machine-readable output: the JSON goes to stdout alone, never contains credentials, and has the same shape the [library](#using-ccswitch-from-a-program) returns. `usage --cached` and `whoami --cached` answer from the per-profile usage cache without refreshing any token or touching the network, which is what a dashboard wants for its first paint.
 
 ### Getting started
 
@@ -79,6 +83,12 @@ ccswitch run work -- -p "summarize this repo"
 The state column is one glyph per profile: `✓` (green) fetched live, `◷ 12m` (yellow) showing cached numbers from 12 minutes ago, `✗` (red) logged out, `→` moved to another machine, and `! <message>` (red) for any other failure.
 
 Each successful lookup is cached per profile in `~/.cache/ccswitch/usage/` (or `$XDG_CACHE_HOME/ccswitch/usage/`). If the usage endpoint answers `429`, that profile shows its last known numbers with a yellow `◷ 12m` state (the age of those numbers) instead of an error. Reset countdowns stay accurate because they are stored as absolute times. Other failures never fall back to the cache, so stale numbers can't hide a real problem.
+
+A profile that has been used through `ccswitch run` may hold a newer chain in its run dir than in the profile file (the session refreshed it). `usage` always refreshes from whichever copy expires last, and writes the rotated pair back to both, so an open run session picks it up instead of replaying the pair that just died.
+
+### Checking the setup
+
+`ccswitch whoami` shows the login currently in `~/.claude`, whether or not a profile holds it: account, tier, plan, the owning profile, token expiry and the same quota bars as `usage`. `ccswitch doctor` reports where the `claude` binary, the profile store, the live login and the credentials file are, and on macOS whether the login keychain is unlocked and which Keychain items exist (by presence only; it never prints a secret, and never locks, unlocks or deletes anything). It exits 1 when the binary is missing or the store is encrypted and no passphrase is available.
 
 ### Kimi Code accounts
 
@@ -129,6 +139,26 @@ ccswitch import-all ccswitch-all.ccswitch.json
 
 Exported files hold live tokens in plaintext — treat them like passwords (or encrypt the store first, below).
 
+### Using ccswitch from a program
+
+The script is also an ES module with no side effects on import, and the package ships `ccswitch.d.ts`, so a Node program can depend on it (`"ccswitch": "github:<owner>/claude-session-swap#<commit sha>"`, or `link:../claude-session-swap` while developing) and `import { ... } from 'ccswitch'`. The functions meant for that use return plain data and never the credentials:
+
+- `listProfileRecords(cfg)` is `list --json`; `listProfilesWithUsage({ refresh }, cfg, fetchImpl)` is `usage --json` (`refresh: false` is `--cached`).
+- `liveIdentity(cfg)` and `liveUsage({ refresh }, cfg, fetchImpl)` describe the live login, profile or not.
+- `prepareRun(name, cfg)` does everything `run` does around the spawn and leaves the spawn to you: it materializes the run dir, evicts the stale Keychain item, and returns `{ bin, env, dir, profile, finish }`. Spread `env` over the child's environment, start `bin` however you like (a pty, for instance), and call `finish()` after it exits to save rotated tokens back.
+- `doctor(cfg)` is `doctor --json`.
+
+Always pass `config('claude')` or `config('kimi')` explicitly: the default target follows the bin name the process was started under. Every network function takes a `fetchImpl` as its last parameter for tests. If the store is encrypted, set `CCSWITCH_PASSPHRASE` in the program's environment (or call `setPassphrase`) before reading profiles.
+
+```js
+import { config, prepareRun } from 'ccswitch';
+import * as pty from 'node-pty';
+
+const run = prepareRun('work', config('claude'));
+const child = pty.spawn(run.bin, [], { env: { ...process.env, ...run.env } });
+child.onExit(() => run.finish());
+```
+
 ### Encryption at rest (opt-in)
 
 ```sh
@@ -142,7 +172,7 @@ Once encrypted, profiles, backups and any new exports are sealed with scrypt-der
 
 - **Profiles** live as JSON files in `~/.claude-profiles/profiles/` (`~/.kimi-profiles/profiles/` for kimi), holding the credential payload and the `oauthAccount` identity, with `0600` permissions.
 - **Switching** captures the live credentials, saves them back to the outgoing profile (only if the live identity still matches it), then writes the new profile's credentials to `~/.claude/.credentials.json` and surgically updates the single `oauthAccount` key in `~/.claude.json` via an atomic rename — the other ~95 keys (projects, history, settings) are never touched. On macOS any Keychain entry is evicted at the same time, so Claude Code reads the file. For kimi, switching only swaps `~/.kimi-code/credentials/kimi-code.json` — the token itself carries the account.
-- **Run sessions** (`ccswitch run`) save refreshed tokens back into the profile when the session exits — OAuth refresh tokens are single-use, so without this the profile snapshot would go stale after the first in-session token refresh.
+- **Run sessions** (`ccswitch run`) save refreshed tokens back into the profile when the session exits — OAuth refresh tokens are single-use, so without this the profile snapshot would go stale after the first in-session token refresh. On macOS a refresh inside the session lands in the run dir's own Keychain item (`Claude Code-credentials-<hash of the dir>`), so that item is folded into the run dir's credentials file and evicted on save-back, and evicted again before the next launch so the session reads the file. A session that died without its save-back is reconciled on the next `run` or `usage`: whichever copy of the chain expires last is the live one, and it wins.
 - **Backups**: every mutation (switch, login, delete) first writes a timestamped snapshot to the store's `backups/` directory, so any state is recoverable.
 - **Safety checks**: a failed or abandoned `login` restores the previous credentials; switching warns if `claude`/`kimi` is currently running (open sessions keep the old account and may rewrite the stored credentials on token refresh); the active profile can't be deleted.
 

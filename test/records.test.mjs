@@ -142,6 +142,29 @@ test('liveIdentity on kimi borrows display fields from the matching profile', (t
   assert.equal(id.subscriptionType, null);
 });
 
+test('liveUsage on kimi remembers the /me fields of a login no profile holds', async (t) => {
+  kimiSandbox(t);
+  const cfg = config('kimi');
+  writeCredentials(kimiCreds({ sub: 'u-1' }), cfg);
+  assert.equal(liveIdentity(cfg).account, 'u-1'); // nothing looked up yet
+  const fetchImpl = async (url) => {
+    if (url.endsWith('/usages')) return { ok: true, status: 200, json: async () => ({ usage: { limit: '100', remaining: '60' } }) };
+    if (url.endsWith('/me')) return { ok: true, status: 200, json: async () => ({ user_id: 'u-1', nickname: 'Shy', email: 'shy@x.com', user_level_name: 'Pro' }) };
+    throw new Error(`unexpected url ${url}`);
+  };
+  const out = await liveUsage({}, cfg, fetchImpl);
+  assert.equal(out.usage.summary.utilization, 40);
+  const id = liveIdentity(cfg);
+  assert.equal(id.account, 'shy@x.com');
+  assert.equal(id.tier, 'Pro');
+  assert.equal(id.accountId, 'u-1');
+
+  // A login to another account never inherits them.
+  writeCredentials(kimiCreds({ sub: 'u-2' }), cfg);
+  assert.equal(liveIdentity(cfg).account, 'u-2');
+  assert.equal(liveIdentity(cfg).tier, null);
+});
+
 test('liveUsage refreshes an expired live token, persists it, and caches under .live', async (t) => {
   sandbox(t);
   const cfg = config();

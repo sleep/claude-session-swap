@@ -285,7 +285,7 @@ export function readKimiConnection(cfg = config('kimi')) {
 
 // Account/level cells for list and usage, across both identity shapes.
 function displayAccount(oauthAccount) {
-  return oauthAccount?.emailAddress ?? oauthAccount?.nickname ?? oauthAccount?.email ?? oauthAccount?.userId ?? null;
+  return oauthAccount?.emailAddress ?? oauthAccount?.email ?? oauthAccount?.nickname ?? oauthAccount?.userId ?? null;
 }
 
 function displayTier(oauthAccount) {
@@ -1432,8 +1432,10 @@ export function kimiWindowLabel(window) {
 
 function kimiUsageRow(raw, { name = null, window = null } = {}) {
   if (!raw || typeof raw !== 'object') return null;
-  const used = toIntOrNull(raw.used);
   const limit = toIntOrNull(raw.limit);
+  const remaining = toIntOrNull(raw.remaining);
+  // Newer responses report what is left instead of what was used.
+  const used = toIntOrNull(raw.used) ?? (limit !== null && remaining !== null ? Math.max(0, limit - remaining) : null);
   if (used === null && limit === null) return null;
   const w = window ?? kimiWindowFrom(raw.window);
   return {
@@ -1463,11 +1465,21 @@ function parseKimiBooster(raw) {
   };
 }
 
+// `usages.limit_<window>.used_ratio` is exact where used/limit are whole
+// percents, so a little use still shows above zero.
+function withUsedRatio(row, ratios, key) {
+  const ratio = ratios?.[key]?.used_ratio;
+  if (!row || typeof ratio !== 'number' || !Number.isFinite(ratio)) return row;
+  return { ...row, utilization: Math.max(0, Math.min(1, ratio)) * 100 };
+}
+
 export function parseKimiUsage(body) {
   const rec = body && typeof body === 'object' ? body : {};
+  const ratios = rec.usages && typeof rec.usages === 'object' ? rec.usages : null;
   let summary = kimiUsageRow(rec.usage);
   // kimi treats a windowless summary as the weekly quota.
   if (summary && !summary.label) summary = { ...summary, label: '1w' };
+  summary = withUsedRatio(summary, ratios, 'limit_7d');
   const limits = [];
   if (Array.isArray(rec.limits)) {
     for (const item of rec.limits) {
@@ -1475,10 +1487,10 @@ export function parseKimiUsage(body) {
         name: typeof item?.name === 'string' && item.name ? item.name : null,
         window: kimiWindowFrom(item?.window),
       });
-      if (row) limits.push(row);
+      if (row) limits.push(row.label ? withUsedRatio(row, ratios, `limit_${row.label}`) : row);
     }
   }
-  return { summary, limits, booster: parseKimiBooster(rec.boosterWallet) };
+  return { summary, limits, booster: parseKimiBooster(rec.boosterWallet ?? rec.booster_wallet) };
 }
 
 export async function fetchKimiUsage(credentials, fetchImpl = fetch, { baseUrl } = {}) {
@@ -1802,6 +1814,31 @@ export async function listProfilesWithUsage({ refresh = true } = {}, cfg = confi
 // The login currently in ~/.claude (or ~/.kimi-code), whether or not any
 // profile holds it. Nothing here returns the credentials themselves.
 
+// /me display fields of a kimi live login that no profile holds, keyed by
+// user id so a login to another account never inherits them.
+const LIVE_ACCOUNT_CACHE = '.live-account';
+
+function readLiveAccount(cfg) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(cfg.usageCacheDir, `${LIVE_ACCOUNT_CACHE}.json`), 'utf8'));
+    return rec && typeof rec.userId === 'string' ? rec : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLiveAccount(me, cfg) {
+  try {
+    fs.mkdirSync(cfg.usageCacheDir, { recursive: true, mode: 0o700 });
+    const file = path.join(cfg.usageCacheDir, `${LIVE_ACCOUNT_CACHE}.json`);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(me), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } catch {
+    // Display fields only; the user id still names the account.
+  }
+}
+
 function identityFrom(live, profiles, active, cfg) {
   const key = identityKey(live.oauthAccount);
   // The active profile is the expected owner; it wins over any copy of the
@@ -1809,7 +1846,9 @@ function identityFrom(live, profiles, active, cfg) {
   const ordered = [...profiles.filter((p) => p.name === active), ...profiles.filter((p) => p.name !== active)];
   const match = key ? ordered.find((p) => identityKey(p.oauthAccount) === key) ?? null : null;
   // A kimi profile carries /me display fields the bare token cannot provide.
-  const account = live.credentials ? { ...(match?.oauthAccount ?? {}), ...(live.oauthAccount ?? {}) } : null;
+  const cached = cfg.target === 'kimi' && !match ? readLiveAccount(cfg) : null;
+  const seen = cached && key && cached.userId === key ? cached : {};
+  const account = live.credentials ? { ...seen, ...(match?.oauthAccount ?? {}), ...(live.oauthAccount ?? {}) } : null;
   const oauth = cfg.target === 'kimi' ? null : claudeOauth(live.credentials);
   return {
     loggedIn: !!live.credentials,
@@ -1860,6 +1899,10 @@ export async function liveUsage({ refresh = true } = {}, cfg = config(), fetchIm
         : fetchUsage(credentials, fetchImpl),
     );
     out.usage = got.usage;
+    if (cfg.target === 'kimi') {
+      const me = await fetchKimiUserInfo(readKimiConnection(cfg).baseUrl, JSON.parse(credentials).access_token, fetchImpl);
+      if (me) writeLiveAccount(me, cfg);
+    }
     if (got.cachedAt) {
       out.cachedAt = got.cachedAt;
       out.state = { kind: 'cached', at: got.cachedAt };

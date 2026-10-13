@@ -495,6 +495,27 @@ test('parseKimiUsage parses the weekly summary, scoped limits and the booster wa
   assert.equal(formatCents(950, 'CNY'), 'CNY 9.50');
 });
 
+test('parseKimiUsage reads remaining counts, exact used ratios and a snake_case booster wallet', () => {
+  const usage = parseKimiUsage({
+    usage: { limit: '100', remaining: '90', resetTime: '2026-10-17T03:31:07Z' },
+    limits: [
+      { window: { duration: 300, timeUnit: 'TIME_UNIT_MINUTE' }, detail: { limit: '100', remaining: '100', resetTime: '2026-10-13T12:31:07Z' } },
+    ],
+    booster_wallet: { balance: { type: 'BOOSTER', amount: 950000000, amountLeft: 475000000 } },
+    usages: { limit_5h: { used_ratio: 0.0002 }, limit_7d: { used_ratio: 0.1027 } },
+  });
+  assert.equal(usage.summary.used, 10);
+  assert.equal(usage.summary.limit, 100);
+  assert.ok(Math.abs(usage.summary.utilization - 10.27) < 1e-9);
+  assert.equal(usage.limits[0].label, '5h');
+  assert.equal(usage.limits[0].used, 0);
+  assert.ok(Math.abs(usage.limits[0].utilization - 0.02) < 1e-9);
+  assert.deepEqual(usage.booster, { balanceCents: 475, totalCents: 950, currency: 'USD' });
+
+  // Without the ratio block the counts alone decide.
+  assert.equal(parseKimiUsage({ usage: { limit: 100, remaining: 25 } }).summary.utilization, 75);
+});
+
 test('fetchKimiUsage sends the bearer token and maps 401 to AuthDeadError', async () => {
   const token = fakeJwt({ sub: 'user-1' });
   const calls = [];

@@ -1214,11 +1214,16 @@ export class AuthDeadError extends Error {}
 // rows fall back to the last usage that did come through (see readUsageCache).
 export class RateLimitedError extends Error {}
 
+// Records hold parsed usage, so a parser fix must not be undone by replaying a
+// record the old parser wrote. Bump whenever parseUsage/parseKimiUsage changes
+// what a field means.
+const USAGE_CACHE_VERSION = 2;
+
 export function writeUsageCache(name, usage, cfg = config(), now = Date.now()) {
   fs.mkdirSync(cfg.usageCacheDir, { recursive: true, mode: 0o700 });
   const file = path.join(cfg.usageCacheDir, `${name}.json`);
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ fetchedAt: now, usage }), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify({ v: USAGE_CACHE_VERSION, fetchedAt: now, usage }), { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 
@@ -1227,7 +1232,7 @@ export function writeUsageCache(name, usage, cfg = config(), now = Date.now()) {
 export function readUsageCache(name, cfg = config()) {
   try {
     const rec = JSON.parse(fs.readFileSync(path.join(cfg.usageCacheDir, `${name}.json`), 'utf8'));
-    if (typeof rec?.fetchedAt !== 'number' || !rec.usage) return null;
+    if (rec?.v !== USAGE_CACHE_VERSION || typeof rec.fetchedAt !== 'number' || !rec.usage) return null;
     return rec;
   } catch {
     return null;

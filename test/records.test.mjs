@@ -62,6 +62,17 @@ test('listProfilesWithUsage returns one record per profile with usage and state'
   assert.equal(readUsageCache('work', cfg).usage.fiveHour.utilization, 42);
 });
 
+test('readUsageCache ignores records an older parser wrote', (t) => {
+  sandbox(t);
+  const cfg = config('kimi');
+  fs.mkdirSync(cfg.usageCacheDir, { recursive: true });
+  const stale = { summary: { name: null, label: '1w', used: 0, limit: 100, utilization: 0, resetsAt: null }, limits: [], booster: null };
+  fs.writeFileSync(path.join(cfg.usageCacheDir, '.live.json'), JSON.stringify({ fetchedAt: 1234, usage: stale }));
+  assert.equal(readUsageCache('.live', cfg), null);
+  writeUsageCache('.live', { ...stale, summary: { ...stale.summary, used: 10, utilization: 10 } }, cfg, 5678);
+  assert.equal(readUsageCache('.live', cfg).usage.summary.utilization, 10);
+});
+
 test('listProfilesWithUsage refresh:false answers from the cache without touching the network', async (t) => {
   sandbox(t);
   const cfg = config();

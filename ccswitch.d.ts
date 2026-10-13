@@ -122,6 +122,7 @@ export interface KimiUsage {
 export type Usage = ClaudeUsage | KimiUsage;
 
 export interface UsageCacheRecord<U = Usage> {
+  v: number;
   fetchedAt: number;
   usage: U;
 }

@@ -69,7 +69,7 @@ export function config(target = defaultTarget()) {
       home: process.env.KCSWITCH_HOME || path.join(os.homedir(), '.kimi-profiles'),
       usageCacheDir: path.join(usageCacheRoot(), 'kimi'),
       credentialsFile:
-        process.env.KCSWITCH_CREDENTIALS_FILE || path.join(kimiHome, 'credentials', 'kimi-code.json'),
+        process.env.KCSWITCH_CREDENTIALS_FILE || kimiCredentialsFile(kimiHome),
       kimiHome,
       kimiBin: bin,
       bin,
@@ -256,14 +256,12 @@ export function kimiIdentityFromCredentials(credentials) {
   }
 }
 
-// Region/endpoint hints, mirroring kimi's own resolution order: env override,
-// then the persisted login in config.toml's managed-provider section, then the
-// mainland-cn default. Parsed with regexes to stay zero-dependency; anything
-// unreadable just falls through to the defaults.
-export function readKimiConnection(cfg = config('kimi')) {
+// config.toml's managed-provider section and its oauth subsection, parsed with
+// regexes to stay zero-dependency; an unreadable file reads as empty.
+function readKimiProviderConfig(kimiHome) {
   let text = '';
   try {
-    text = fs.readFileSync(path.join(cfg.kimiHome, 'config.toml'), 'utf8');
+    text = fs.readFileSync(path.join(kimiHome, 'config.toml'), 'utf8');
   } catch {}
   const sectionBody = (header) => {
     const m = new RegExp(`^\\[${header.replace(/[."[\]]/g, (c) => `\\${c}`)}\\][ \\t]*$`, 'm').exec(text);
@@ -272,14 +270,35 @@ export function readKimiConnection(cfg = config('kimi')) {
     const next = rest.search(/^\[/m);
     return next === -1 ? rest : rest.slice(0, next);
   };
-  const str = (body, key) =>
-    new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, 'm').exec(body)?.[1] ?? null;
-  const provider = sectionBody('providers."managed:kimi-code"');
-  const oauth = sectionBody('providers."managed:kimi-code".oauth');
+  const body = (header) => {
+    const b = sectionBody(header);
+    return (key) => new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, 'm').exec(b)?.[1] ?? null;
+  };
+  return { provider: body('providers."managed:kimi-code"'), oauth: body('providers."managed:kimi-code".oauth') };
+}
+
+// kimi names its token file after the login's oauth key: the default host keeps
+// "oauth/kimi-code", while a login against another host (e.g. auth.kimi.ai)
+// gets "oauth/kimi-code-env-<hash>" and credentials/kimi-code-env-<hash>.json.
+function kimiCredentialsFile(kimiHome) {
+  const key = readKimiProviderConfig(kimiHome).oauth('key');
+  const name = key ? path.posix.basename(key) : '';
+  return path.join(kimiHome, 'credentials', `${/^[\w.-]+$/.test(name) ? name : 'kimi-code'}.json`);
+}
+
+// Region/endpoint hints, mirroring kimi's own resolution order: env override,
+// then the persisted login in config.toml's managed-provider section, then the
+// mainland-cn default.
+export function readKimiConnection(cfg = config('kimi')) {
+  const { provider, oauth } = readKimiProviderConfig(cfg.kimiHome);
   return {
-    baseUrl: process.env.KIMI_CODE_BASE_URL ?? str(provider, 'base_url') ?? KIMI_DEFAULT_BASE_URL,
+    baseUrl: process.env.KIMI_CODE_BASE_URL ?? provider('base_url') ?? KIMI_DEFAULT_BASE_URL,
     oauthHost:
-      process.env.KIMI_CODE_OAUTH_HOST ?? process.env.KIMI_OAUTH_HOST ?? str(oauth, 'oauthHost') ?? KIMI_DEFAULT_OAUTH_HOST,
+      process.env.KIMI_CODE_OAUTH_HOST ??
+      process.env.KIMI_OAUTH_HOST ??
+      oauth('oauth_host') ??
+      oauth('oauthHost') ??
+      KIMI_DEFAULT_OAUTH_HOST,
   };
 }
 

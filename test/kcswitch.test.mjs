@@ -109,6 +109,26 @@ test('readKimiConnection parses config.toml, env overrides win', (t) => {
   assert.deepEqual(readKimiConnection(cfg), { baseUrl: 'https://example.com/v1', oauthHost: 'https://auth.example.com' });
 });
 
+test('readKimiConnection reads the oauth_host kimi writes', (t) => {
+  sandbox(t);
+  const cfg = config('kimi');
+  writeKimiConfig(cfg, AI_CONFIG_TOML.replace('oauthHost = ', 'oauth_host = '));
+  assert.equal(readKimiConnection(cfg).oauthHost, 'https://auth.kimi.ai');
+});
+
+test('config("kimi") follows the oauth key to a per-host credentials file', (t) => {
+  sandbox(t);
+  const base = config('kimi');
+  writeKimiConfig(base, AI_CONFIG_TOML.replace('storage = "file"', 'storage = "file"\nkey = "oauth/kimi-code-env-0e4f99c69cc27850"'));
+  const cfg = config('kimi');
+  assert.equal(cfg.credentialsFile, path.join(cfg.kimiHome, 'credentials', 'kimi-code-env-0e4f99c69cc27850.json'));
+  fs.mkdirSync(path.dirname(cfg.credentialsFile), { recursive: true });
+  fs.writeFileSync(cfg.credentialsFile, kimiCreds({ sub: 'u-global' }));
+  assert.deepEqual(captureLive(cfg).oauthAccount, { userId: 'u-global' });
+  writeKimiConfig(base, AI_CONFIG_TOML.replace('storage = "file"', 'storage = "file"\nkey = "oauth/../../escape"'));
+  assert.equal(config('kimi').credentialsFile, path.join(cfg.kimiHome, 'credentials', 'escape.json'));
+});
+
 test('captureLive derives kimi identity from the token JWT', (t) => {
   sandbox(t);
   const cfg = config('kimi');

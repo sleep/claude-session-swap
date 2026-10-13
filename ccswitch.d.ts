@@ -273,6 +273,7 @@ export function updateOauthAccount(oauthAccount: OauthAccount | null, cfg?: Conf
 export function decodeJwtPayload(token: unknown): Record<string, unknown> | null;
 export function kimiIdentityFromCredentials(credentials: string | null): { userId: string } | null;
 export function readKimiConnection(cfg?: KimiConfig): KimiConnection;
+export function kimiOAuthSlot(conn: { oauthHost?: string; baseUrl?: string }): string;
 
 export function encryptText(plain: string, passphrase: string): string;
 export function decryptText(raw: string | object, passphrase: string): string;

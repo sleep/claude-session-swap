@@ -105,7 +105,7 @@ Installed via `npm link`, the `kcswitch` bin alias makes kimi the default target
 
 Differences from the claude side, all consequences of how kimi stores its login:
 
-- **File-only store.** The live login is `~/.kimi-code/credentials/kimi-code.json`; there is no Keychain path and no identity file. The account identity is the `sub` claim of the access-token JWT.
+- **File-only store.** The live login is `~/.kimi-code/credentials/kimi-code.json` for the default (kimi.com) endpoints and `kimi-code-env-<hash>.json` for any other host or base URL (e.g. kimi.ai), the same per-environment slot kimi derives; there is no Keychain path and no identity file. The account identity is the `sub` claim of the access-token JWT.
 - **Display names come from the network.** Tokens carry no email, so `list`/`usage` show the account's email (or nickname when it has none) and level from a best-effort `GET /coding/v1/me`, cached in the profile after `login` and each successful `usage`. A live login that no profile holds keeps its own copy in the usage cache, refreshed by `liveUsage`. Until then the bare user id is shown.
 - **Region is recorded per profile.** kimi's deployment is either mainland-cn (`kimi.com`, the default) or global (`kimi.ai`); the endpoints are read from `~/.kimi-code/config.toml` (or `KIMI_CODE_BASE_URL`/`KIMI_CODE_OAUTH_HOST`) at save/login time so token refreshes and usage lookups hit the right one. Pass `--region global` to `ccswitch kimi login` for a first-time kimi.ai login: `ccswitch kimi login work --region global`.
 - **`run` isolates a whole `KIMI_CODE_HOME`.** `ccswitch kimi run work -- -p "..."` launches kimi with `KIMI_CODE_HOME` pointed at a per-profile directory containing the credentials file plus a minimal seeded `config.toml` pinning the region endpoints (your own `config.toml` is never copied — it can hold API keys). Rotated tokens are saved back into the profile on exit, same as claude.
@@ -188,7 +188,7 @@ Environment variables override the defaults (mainly useful for testing). The kim
 | `CCSWITCH_CLAUDE_JSON` | `~/.claude.json` |
 | `CCSWITCH_CLAUDE_BIN` | `claude` |
 | `KCSWITCH_HOME` | `~/.kimi-profiles` |
-| `KCSWITCH_CREDENTIALS_FILE` | `$KCSWITCH_KIMI_HOME/credentials/kimi-code.json` |
+| `KCSWITCH_CREDENTIALS_FILE` | `$KCSWITCH_KIMI_HOME/credentials/<slot>.json`, the slot kimi derives from `config.toml`'s endpoints |
 | `KCSWITCH_KIMI_HOME` | `$KIMI_CODE_HOME`, else `~/.kimi-code` |
 | `KCSWITCH_KIMI_BIN` | `kimi` |
 | `CCSWITCH_CACHE_DIR` | `$XDG_CACHE_HOME/ccswitch`, else `~/.cache/ccswitch` (usage cache, shared by both stores) |

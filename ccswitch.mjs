@@ -4,7 +4,7 @@
 // macOS, Claude Code itself prefers the Keychain, so a lingering Keychain
 // entry is read as the freshest copy and evicted on every write — after
 // which Claude Code falls back to the credentials file.
-// Kimi credentials live at <KIMI_CODE_HOME>/credentials/kimi-code.json
+// Kimi credentials live at <KIMI_CODE_HOME>/credentials/<slot>.json
 // (file-only, every platform); a leading "kimi" in the command line selects
 // that backend, as does running under the "kcswitch" bin name.
 // Zero dependencies by design: this tool handles OAuth refresh tokens, so
@@ -226,11 +226,12 @@ export function updateOauthAccount(oauthAccount, cfg = config()) {
 }
 
 // --- Kimi Code backend ----------------------------------------------------------
-// Kimi Code keeps a single login at <KIMI_CODE_HOME>/credentials/kimi-code.json
-// ({access_token, refresh_token, expires_at, scope, token_type, expires_in},
-// expires_at in unix seconds). The access token is a JWT whose `sub` is the
-// account's user id — the only on-disk identity, since kimi has no
-// ~/.claude.json-style account record. Display fields (nickname, email, level)
+// Kimi Code keeps the login at <KIMI_CODE_HOME>/credentials/<slot>.json, the
+// slot being kimi-code for the default endpoints and kimi-code-env-<hash>
+// otherwise (see kimiOAuthSlot). The payload is {access_token, refresh_token,
+// expires_at, scope, token_type, expires_in}, expires_at in unix seconds. The
+// access token is a JWT whose `sub` is the account's user id — the only
+// on-disk identity, since kimi has no ~/.claude.json-style account record. Display fields (nickname, email, level)
 // come from best-effort GETs to <baseUrl>/me and are cached in the profile.
 
 const KIMI_CLIENT_ID = '17e5f671-d194-4dfb-9706-5516cb48c098'; // kimi-code's public client id
@@ -277,20 +278,11 @@ function readKimiProviderConfig(kimiHome) {
   return { provider: body('providers."managed:kimi-code"'), oauth: body('providers."managed:kimi-code".oauth') };
 }
 
-// kimi names its token file after the login's oauth key: the default host keeps
-// "oauth/kimi-code", while a login against another host (e.g. auth.kimi.ai)
-// gets "oauth/kimi-code-env-<hash>" and credentials/kimi-code-env-<hash>.json.
-function kimiCredentialsFile(kimiHome) {
-  const key = readKimiProviderConfig(kimiHome).oauth('key');
-  const name = key ? path.posix.basename(key) : '';
-  return path.join(kimiHome, 'credentials', `${/^[\w.-]+$/.test(name) ? name : 'kimi-code'}.json`);
-}
-
 // Region/endpoint hints, mirroring kimi's own resolution order: env override,
 // then the persisted login in config.toml's managed-provider section, then the
-// mainland-cn default.
-export function readKimiConnection(cfg = config('kimi')) {
-  const { provider, oauth } = readKimiProviderConfig(cfg.kimiHome);
+// mainland-cn default. kimi itself writes oauth_host; older seeds used oauthHost.
+function kimiConnectionAt(kimiHome) {
+  const { provider, oauth } = readKimiProviderConfig(kimiHome);
   return {
     baseUrl: process.env.KIMI_CODE_BASE_URL ?? provider('base_url') ?? KIMI_DEFAULT_BASE_URL,
     oauthHost:
@@ -300,6 +292,26 @@ export function readKimiConnection(cfg = config('kimi')) {
       oauth('oauthHost') ??
       KIMI_DEFAULT_OAUTH_HOST,
   };
+}
+
+export function readKimiConnection(cfg = config('kimi')) {
+  return kimiConnectionAt(cfg.kimiHome);
+}
+
+// kimi stores each (oauthHost, baseUrl) environment's token in its own slot and
+// re-derives the slot on every start, ignoring a config.toml `key` that
+// disagrees. Mirrors resolveKimiCodeOAuthKey in kimi-code 2.x.
+export function kimiOAuthSlot({ oauthHost, baseUrl }) {
+  const norm = (u) => u.trim().replace(/\/+$/, '');
+  const host = norm(oauthHost ?? KIMI_DEFAULT_OAUTH_HOST);
+  const base = norm(baseUrl ?? KIMI_DEFAULT_BASE_URL);
+  if (host === norm(KIMI_DEFAULT_OAUTH_HOST) && base === norm(KIMI_DEFAULT_BASE_URL)) return 'kimi-code';
+  const hash = crypto.createHash('sha256').update(JSON.stringify({ oauthHost: host, baseUrl: base })).digest('hex');
+  return `kimi-code-env-${hash.slice(0, 16)}`;
+}
+
+function kimiCredentialsFile(kimiHome) {
+  return path.join(kimiHome, 'credentials', `${kimiOAuthSlot(kimiConnectionAt(kimiHome))}.json`);
 }
 
 // Account/level cells for list and usage, across both identity shapes.
@@ -1082,7 +1094,7 @@ function runDirPath(name, cfg) {
 }
 
 function runDirCredentialsFile(dir, cfg) {
-  return cfg.target === 'kimi' ? path.join(dir, 'credentials', 'kimi-code.json') : path.join(dir, '.credentials.json');
+  return cfg.target === 'kimi' ? kimiCredentialsFile(dir) : path.join(dir, '.credentials.json');
 }
 
 // What a run dir currently holds. On macOS claude prefers the Keychain, so a
@@ -1123,6 +1135,10 @@ export function materializeRunDir(name, cfg = config()) {
   return materializeRun(name, cfg).dir;
 }
 
+// The seed earlier versions wrote: no key, and oauthHost where kimi writes oauth_host.
+const OLD_KIMI_RUN_SEED =
+  /^\[providers\."managed:kimi-code"\]\ntype = "kimi"\nbase_url = "[^"\n]*"\n\n\[providers\."managed:kimi-code"\.oauth\]\nstorage = "file"\noauthHost = "[^"\n]*"\n$/;
+
 function materializeRun(name, cfg) {
   const profile = loadProfile(name, cfg);
   assertNotMoved(name, profile, cfg);
@@ -1143,21 +1159,20 @@ function materializeRun(name, cfg) {
     // The run dir is a whole KIMI_CODE_HOME: credentials plus a minimal
     // config.toml that pins the region endpoints. The user's own config.toml
     // is never copied — it can hold API keys for other providers.
-    const credDir = path.join(dir, 'credentials');
-    fs.mkdirSync(credDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(credDir, 'kimi-code.json'), profile.credentials ?? '', { mode: 0o600 });
     const confPath = path.join(dir, 'config.toml');
-    if (!fs.existsSync(confPath)) {
-      const conn = readKimiConnection(cfg);
-      const baseUrl = profile.oauthAccount?.baseUrl ?? conn.baseUrl;
-      const oauthHost = profile.oauthAccount?.oauthHost ?? conn.oauthHost;
-      fs.writeFileSync(
-        confPath,
-        `[providers."managed:kimi-code"]\ntype = "kimi"\nbase_url = "${baseUrl}"\n\n` +
-          `[providers."managed:kimi-code".oauth]\nstorage = "file"\noauthHost = "${oauthHost}"\n`,
-        { mode: 0o600 },
-      );
+    const conn = readKimiConnection(cfg);
+    const baseUrl = profile.oauthAccount?.baseUrl ?? conn.baseUrl;
+    const oauthHost = profile.oauthAccount?.oauthHost ?? conn.oauthHost;
+    const seed =
+      `[providers."managed:kimi-code"]\ntype = "kimi"\nbase_url = "${baseUrl}"\n\n` +
+      `[providers."managed:kimi-code".oauth]\nstorage = "file"\n` +
+      `key = "oauth/${kimiOAuthSlot({ oauthHost, baseUrl })}"\noauth_host = "${oauthHost}"\n`;
+    if (!fs.existsSync(confPath) || OLD_KIMI_RUN_SEED.test(fs.readFileSync(confPath, 'utf8'))) {
+      fs.writeFileSync(confPath, seed, { mode: 0o600 });
     }
+    const credFile = runDirCredentialsFile(dir, cfg);
+    fs.mkdirSync(path.dirname(credFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(credFile, profile.credentials ?? '', { mode: 0o600 });
     return { dir, profile };
   }
   fs.writeFileSync(path.join(dir, '.credentials.json'), profile.credentials ?? '', { mode: 0o600 });
@@ -2151,7 +2166,7 @@ function help(cfg) {
   const crossRef =
     cfg.target === 'kimi'
       ? `This is the Kimi Code store: state lives in ~/.kimi-profiles, the live login
-is ~/.kimi-code/credentials/kimi-code.json, and "run" isolates via
+is ~/.kimi-code/credentials/kimi-code*.json, and "run" isolates via
 KIMI_CODE_HOME. "${cfg.prog} login <name>" runs "kimi login" (pass --region
 global for kimi.ai accounts; mainland-cn is the default). Claude Code accounts
 live under the sibling "ccswitch" bin. KCSWITCH_* env vars mirror the CCSWITCH_*
@@ -2161,7 +2176,7 @@ ones; CCSWITCH_PASSPHRASE and KCSWITCH_PASSPHRASE both work for either store.`
 and so on through the whole command set. "ccswitch kimi login <name>" runs
 "kimi login" (pass --region global for kimi.ai accounts; mainland-cn is the
 default). Kimi state lives in ~/.kimi-profiles, the live login is
-~/.kimi-code/credentials/kimi-code.json, and "run" isolates via KIMI_CODE_HOME.
+~/.kimi-code/credentials/kimi-code*.json, and "run" isolates via KIMI_CODE_HOME.
 Installed under the "kcswitch" bin name, the tool targets kimi without the
 prefix. (A claude profile literally named "kimi" stays reachable via
 "ccswitch switch kimi".) KCSWITCH_* env vars mirror the CCSWITCH_* ones;

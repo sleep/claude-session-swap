@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 
 import { kimiSandbox as sandbox, fakeJwt, kimiCreds, fakeKimiBin, captureLog, CLI, runCli } from './helpers.mjs';
 
-import { config, UsageError, readCredentials, writeCredentials, deleteCredentials, saveProfile, loadProfile, profileExists, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, saveBackRunDir, setPassphrase, storeEncrypted, setStoreEncryption, isEncrypted, main, tokenExpired, refreshKimiCredentials, AuthDeadError, fetchKimiUsage, parseKimiUsage, kimiWindowLabel, fetchKimiUserInfo, enrichKimiIdentity, readKimiConnection, decodeJwtPayload, kimiIdentityFromCredentials, kimiUsageCmd, usageCmd, formatCents, defaultTarget } from '../ccswitch.mjs';
+import { config, UsageError, readCredentials, writeCredentials, deleteCredentials, saveProfile, loadProfile, profileExists, getActive, setActive, writeBackup, captureLive, switchTo, tokenExpiry, formatList, deleteProfileCmd, login, saveCurrent, exportProfile, importProfile, materializeRunDir, runProfile, saveBackRunDir, setPassphrase, storeEncrypted, setStoreEncryption, isEncrypted, main, tokenExpired, refreshKimiCredentials, AuthDeadError, fetchKimiUsage, parseKimiUsage, kimiWindowLabel, fetchKimiUserInfo, enrichKimiIdentity, readKimiConnection, kimiOAuthSlot, decodeJwtPayload, kimiIdentityFromCredentials, kimiUsageCmd, usageCmd, formatCents, defaultTarget } from '../ccswitch.mjs';
 
 const AI_CONFIG_TOML = `default_model = "kimi-code/k3"
 
@@ -116,17 +116,27 @@ test('readKimiConnection reads the oauth_host kimi writes', (t) => {
   assert.equal(readKimiConnection(cfg).oauthHost, 'https://auth.kimi.ai');
 });
 
-test('config("kimi") follows the oauth key to a per-host credentials file', (t) => {
+test('kimiOAuthSlot matches the slots kimi derives per environment', () => {
+  assert.equal(kimiOAuthSlot({}), 'kimi-code');
+  assert.equal(kimiOAuthSlot({ oauthHost: 'https://auth.kimi.com/', baseUrl: ' https://api.kimi.com/coding/v1// ' }), 'kimi-code');
+  // The slot kimi 2.1.1 wrote for a kimi.ai login:
+  assert.equal(
+    kimiOAuthSlot({ oauthHost: 'https://auth.kimi.ai', baseUrl: 'https://api.kimi.ai/coding/v1' }),
+    'kimi-code-env-0e4f99c69cc27850',
+  );
+});
+
+test('config("kimi") reads the live login from the configured environment\'s slot', (t) => {
   sandbox(t);
-  const base = config('kimi');
-  writeKimiConfig(base, AI_CONFIG_TOML.replace('storage = "file"', 'storage = "file"\nkey = "oauth/kimi-code-env-0e4f99c69cc27850"'));
+  writeKimiConfig(config('kimi'));
   const cfg = config('kimi');
   assert.equal(cfg.credentialsFile, path.join(cfg.kimiHome, 'credentials', 'kimi-code-env-0e4f99c69cc27850.json'));
   fs.mkdirSync(path.dirname(cfg.credentialsFile), { recursive: true });
   fs.writeFileSync(cfg.credentialsFile, kimiCreds({ sub: 'u-global' }));
   assert.deepEqual(captureLive(cfg).oauthAccount, { userId: 'u-global' });
-  writeKimiConfig(base, AI_CONFIG_TOML.replace('storage = "file"', 'storage = "file"\nkey = "oauth/../../escape"'));
-  assert.equal(config('kimi').credentialsFile, path.join(cfg.kimiHome, 'credentials', 'escape.json'));
+  // kimi re-derives the slot from the endpoints, so a stale key is ignored:
+  writeKimiConfig(cfg, AI_CONFIG_TOML.replace('storage = "file"', 'storage = "file"\nkey = "oauth/kimi-code"'));
+  assert.equal(config('kimi').credentialsFile, cfg.credentialsFile);
 });
 
 test('captureLive derives kimi identity from the token JWT', (t) => {
@@ -368,13 +378,24 @@ test('materializeRunDir kimi writes credentials and seeds a minimal config.toml'
   const dir = materializeRunDir('work', cfg);
   assert.equal(dir, path.join(cfg.home, 'dirs', 'work'));
   assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
-  const credFile = path.join(dir, 'credentials', 'kimi-code.json');
+  // kimi reads a kimi.ai login from its scoped slot, not credentials/kimi-code.json:
+  const credFile = path.join(dir, 'credentials', 'kimi-code-env-0e4f99c69cc27850.json');
   assert.equal(JSON.parse(fs.readFileSync(credFile, 'utf8')).refresh_token, 'rt-1');
   assert.equal(fs.statSync(credFile).mode & 0o777, 0o600);
+  assert.equal(fs.existsSync(path.join(dir, 'credentials', 'kimi-code.json')), false);
   const conf = fs.readFileSync(path.join(dir, 'config.toml'), 'utf8');
   assert.match(conf, /base_url = "https:\/\/api\.kimi\.ai\/coding\/v1"/);
-  assert.match(conf, /oauthHost = "https:\/\/auth\.kimi\.ai"/);
+  assert.match(conf, /oauth_host = "https:\/\/auth\.kimi\.ai"/);
+  assert.match(conf, /key = "oauth\/kimi-code-env-0e4f99c69cc27850"/);
   assert.match(conf, /storage = "file"/);
+  // A run dir seeded by an older version is upgraded in place:
+  fs.writeFileSync(
+    path.join(dir, 'config.toml'),
+    '[providers."managed:kimi-code"]\ntype = "kimi"\nbase_url = "https://api.kimi.ai/coding/v1"\n\n' +
+      '[providers."managed:kimi-code".oauth]\nstorage = "file"\noauthHost = "https://auth.kimi.ai"\n',
+  );
+  materializeRunDir('work', cfg);
+  assert.equal(fs.readFileSync(path.join(dir, 'config.toml'), 'utf8'), conf);
   // A user's own config.toml in the run dir is preserved across re-materialize:
   fs.writeFileSync(path.join(dir, 'config.toml'), '# customized\n');
   materializeRunDir('work', cfg);
